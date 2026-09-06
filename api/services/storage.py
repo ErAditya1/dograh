@@ -40,12 +40,29 @@ def get_storage_for_backend(backend: str) -> BaseFileSystem:
             f"Initializing {backend} storage at {MINIO_ENDPOINT} "
             f"(public: {MINIO_PUBLIC_ENDPOINT}) with bucket '{MINIO_BUCKET}'"
         )
+        # Internal container endpoints (e.g. dograh-minio:9000, localhost:9000) run plain HTTP.
+        # If MINIO_SECURE was set to true because the public domain is HTTPS,
+        # override internal client to secure=False to eliminate urllib3 SSL retries.
+        internal_secure = MINIO_SECURE
+        if internal_secure and (
+            ":9000" in MINIO_ENDPOINT
+            or "dograh-minio" in MINIO_ENDPOINT
+            or "minio" in MINIO_ENDPOINT
+            or "localhost" in MINIO_ENDPOINT
+            or "127.0.0.1" in MINIO_ENDPOINT
+        ):
+            logger.info(
+                f"[Storage] MINIO_ENDPOINT '{MINIO_ENDPOINT}' is an internal HTTP service. "
+                f"Setting internal secure=False (MINIO_PUBLIC_ENDPOINT remains '{MINIO_PUBLIC_ENDPOINT}')."
+            )
+            internal_secure = False
+
         return MinioFileSystem(
             endpoint=MINIO_ENDPOINT,
             access_key=MINIO_ACCESS_KEY,
             secret_key=MINIO_SECRET_KEY,
             bucket_name=MINIO_BUCKET,
-            secure=MINIO_SECURE,
+            secure=internal_secure,
             public_endpoint=MINIO_PUBLIC_ENDPOINT,
         )
 
