@@ -267,8 +267,17 @@ async def smartflo_connect(request: Request) -> Response:
         except Exception as e:
             logger.debug(f"[Smartflo] Could not parse request body: {e}")
 
+    # Helper to sanitize values and ignore unexpanded template variables (e.g. "$callId", "$custom_identifier")
+    def clean_val(val: Any) -> Optional[str]:
+        if val is None:
+            return None
+        s = str(val).strip()
+        if not s or s.startswith("$") or s.lower() in ("none", "null", "undefined"):
+            return None
+        return s
+
     # Extract identifiers
-    call_id = (
+    raw_call_id = (
         params.get("callId")
         or params.get("call_id")
         or body_data.get("callId")
@@ -276,27 +285,35 @@ async def smartflo_connect(request: Request) -> Response:
         or body_data.get("ref_id")
         or params.get("ref_id")
     )
-    custom_identifier = (
+    call_id = clean_val(raw_call_id)
+
+    raw_custom_id = (
         params.get("custom_identifier")
         or body_data.get("custom_identifier")
         or params.get("customIdentifier")
         or body_data.get("customIdentifier")
     )
-    to_number = (
+    custom_identifier = clean_val(raw_custom_id)
+
+    raw_to = (
         params.get("toNumber")
         or params.get("to")
         or body_data.get("toNumber")
         or body_data.get("customer_number")
         or body_data.get("to")
     )
-    from_number = (
+    to_number = clean_val(raw_to)
+
+    raw_from = (
         params.get("fromNumber")
         or params.get("from")
         or body_data.get("fromNumber")
         or body_data.get("caller_id")
         or body_data.get("from")
     )
-    agent_id = params.get("agent_id") or body_data.get("agent_id") or custom_identifier
+    from_number = clean_val(raw_from)
+
+    agent_id = clean_val(params.get("agent_id") or body_data.get("agent_id")) or custom_identifier
 
     # Check if this DID is mapped in Redis to a specific campaign/agent (e.g. did_map:{toNumber})
     if not agent_id and to_number:
@@ -340,10 +357,10 @@ async def smartflo_connect(request: Request) -> Response:
         organization_id_str = organization_id_str or cached_state.get("organization_id")
         agent_id = agent_id or cached_state.get("agent_id")
 
-    # If workflow still not resolved, try resolving via agent_id
-    if (not workflow_id_str or not organization_id_str) and agent_id:
+    # If workflow still not resolved, try resolving via agent_id (or default to primary workflow)
+    if not workflow_id_str or not organization_id_str:
         try:
-            workflow, org_id = await resolve_dograh_agent(str(agent_id))
+            workflow, org_id = await resolve_dograh_agent(str(agent_id or ""))
             workflow_id_str = workflow.id
             organization_id_str = org_id
             
