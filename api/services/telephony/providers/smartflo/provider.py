@@ -398,41 +398,11 @@ class SmartfloProvider(TelephonyProvider):
 
         stream_sid = f"smartflo_stream_{workflow_run_id}"
         call_sid = f"smartflo_call_{workflow_run_id}"
+        encoding = "audio/x-mulaw"
 
-        # Attempt to inspect initial messages with a short timeout.
-        # Smartflo Voice Bot may send {"event": "connected"} and/or {"event": "start"}
-        # or immediately stream binary frames.
-        try:
-            first_msg = await asyncio.wait_for(websocket.receive_text(), timeout=2.0)
-            logger.debug(f"[Smartflo] First WS message: {first_msg}")
-            try:
-                msg_data = json.loads(first_msg)
-                event = msg_data.get("event")
-                if event == "connected":
-                    # Wait for optional second message ("start")
-                    try:
-                        second_msg = await asyncio.wait_for(websocket.receive_text(), timeout=2.0)
-                        logger.debug(f"[Smartflo] Second WS message: {second_msg}")
-                        msg_data = json.loads(second_msg)
-                    except Exception:
-                        pass
-
-                start_data = msg_data.get("start") or msg_data
-                encoding = "audio/x-mulaw"
-                if isinstance(start_data, dict):
-                    stream_sid = start_data.get("streamSid") or stream_sid
-                    call_sid = start_data.get("callSid") or call_sid
-                    media_format = start_data.get("mediaFormat") or {}
-                    if isinstance(media_format, dict):
-                        encoding = media_format.get("encoding") or encoding
-            except Exception as parse_err:
-                logger.debug(f"[Smartflo] Handshake JSON parse note: {parse_err}")
-        except asyncio.TimeoutError:
-            logger.debug(f"[Smartflo] No textual handshake received, proceeding directly")
-        except Exception as e:
-            logger.debug(f"[Smartflo] Handshake wait note: {e}")
-
-        # Start the pipeline with Smartflo transport
+        # Start the pipeline with Smartflo transport.
+        # SmartfloFrameSerializer automatically handles initial 'start', 'connected',
+        # dynamic 'streamSid', and bidirectional media frames.
         await run_pipeline_telephony(
             websocket,
             provider_name=self.PROVIDER_NAME,
