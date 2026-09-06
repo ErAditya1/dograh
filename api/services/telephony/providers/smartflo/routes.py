@@ -332,69 +332,148 @@ async def smartflo_connect(request: Request) -> Response:
         f"query={params}, body={body_data}"
     )
 
-    # If IDs missing, lookup in Redis by call_id, custom_identifier, to_number, from_number
-    cached_state = None
-    for lookup_key in (call_id, custom_identifier, to_number, from_number, agent_id):
-        if lookup_key:
-            cached_state = await get_smartflo_call_state(str(lookup_key))
-            if cached_state:
-                logger.info(f"[Smartflo] Resolved call state via key: {lookup_key}")
-                break
+    # Helper to verify whether a candidate workflow run is active (i.e. not completed/failed/cancelled)
+    async def is_run_active(run_id_candidate: Any) -> bool:
+        if not run_id_candidate:
+            return False
+        try:
+            r_obj = await db_client.get_workflow_run_by_id(int(run_id_candidate))
+            return bool(r_obj and not r_obj.is_completed)
+        except Exception:
+            return False
 
-    # Fail-safe: If Smartflo called connect without identifiers, fall back to the most recent outbound call
-    if not cached_state:
-        latest = await get_smartflo_latest_call()
-        if latest and latest.get("workflow_run_id"):
-            cached_state = latest
-            logger.info(
-                f"[Smartflo] Resolved call state via latest active outbound call: "
-                f"run_id={cached_state.get('workflow_run_id')}, call_id={cached_state.get('call_id')}"
+    # Check if workflow_run_id was passed explicitly and is still active
+    if workflow_run_id_str and not await is_run_active(workflow_run_id_str):
+        logger.info(f"[Smartflo] Specified run {workflow_run_id_str} is already completed. Resetting.")
+        workflow_run_id_str = None
+
+    # If not already bound to an active run, check Redis for an active outbound call
+    # Note: We deliberately do NOT match from_number here, because an inbound caller might have
+    # been the recipient of a past outbound call!
+    cached_state = None
+    if not workflow_run_id_str:
+        for lookup_key in (call_id, custom_identifier, to_number):
+            if lookup_key:
+                state = await get_smartflo_call_state(str(lookup_key))
+                if state and await is_run_active(state.get("workflow_run_id")):
+                    cached_state = state
+                    logger.info(f"[Smartflo] Resolved active call state via key: {lookup_key}")
+                    break
+
+        # Fail-safe: If Smartflo called connect without identifiers, check if latest outbound call is still active
+        if not cached_state:
+            latest = await get_smartflo_latest_call()
+            if latest and await is_run_active(latest.get("workflow_run_id")):
+                cached_state = latest
+                logger.info(
+                    f"[Smartflo] Resolved call state via latest active outbound call: "
+                    f"run_id={cached_state.get('workflow_run_id')}, call_id={cached_state.get('call_id')}"
+                )
+
+        if cached_state:
+            workflow_id_str = workflow_id_str or cached_state.get("workflow_id")
+            workflow_run_id_str = str(cached_state.get("workflow_run_id"))
+            organization_id_str = organization_id_str or cached_state.get("organization_id")
+            agent_id = agent_id or cached_state.get("agent_id")
+
+    # If we STILL don't have an active workflow_run_id, this is a fresh INBOUND call!
+    if not workflow_run_id_str:
+        try:
+            target_agent = agent_id
+            if not target_agent and to_number:
+                target_agent = await get_did_mapping(to_number)
+            if not target_agent:
+                target_agent = await get_default_agent_id()
+
+            workflow, org_id = await resolve_dograh_agent(str(target_agent or ""))
+            workflow_id_str = str(workflow.id)
+            organization_id_str = str(org_id)
+
+            from api.services.workflow.run_creation import prepare_workflow_run_inputs
+
+            caller_phone = from_number or ""
+            did_phone = to_number or ""
+
+            run_inputs = await prepare_workflow_run_inputs(
+                db_client,
+                workflow,
+                initial_context={
+                    "phone_number": caller_phone,
+                    "called_number": did_phone,
+                    "caller_number": caller_phone,
+                    "direction": "inbound",
+                    "provider": "smartflo",
+                    "agent_id": str(target_agent or workflow.id),
+                    "call_id": str(call_id or ""),
+                },
+                use_draft=False,
+                include_template_context=True,
             )
 
-    if cached_state:
-        workflow_id_str = workflow_id_str or cached_state.get("workflow_id")
-        workflow_run_id_str = workflow_run_id_str or cached_state.get("workflow_run_id")
-        organization_id_str = organization_id_str or cached_state.get("organization_id")
-        agent_id = agent_id or cached_state.get("agent_id")
+            concurrency_slot = None
+            try:
+                concurrency_slot = await call_concurrency.acquire_org_slot(
+                    org_id,
+                    source="inbound:smartflo",
+                    timeout=0,
+                )
+            except Exception as ce:
+                logger.warning(f"[Smartflo] Concurrency acquire skipped/failed: {ce}")
 
-    # If workflow still not resolved, try resolving via agent_id (or default to primary workflow)
-    if not workflow_id_str or not organization_id_str:
-        try:
-            workflow, org_id = await resolve_dograh_agent(str(agent_id or ""))
-            workflow_id_str = workflow.id
-            organization_id_str = org_id
-            
-            # If this is a direct incoming connect from Smartflo, initialize a run
-            if not workflow_run_id_str:
-                from api.services.workflow.run_creation import prepare_workflow_run_inputs
-                run_inputs = await prepare_workflow_run_inputs(
-                    db_client,
-                    workflow,
-                    initial_context={
-                        "phone_number": to_number or "",
-                        "called_number": to_number or "",
-                        "caller_number": from_number or "",
-                        "direction": "inbound",
-                        "provider": "smartflo",
-                        "agent_id": str(agent_id),
-                    },
-                    use_draft=False,
-                    include_template_context=True,
-                )
-                inbound_run = await db_client.create_workflow_run(
-                    f"WR-SMARTFLO-IN-{int(time.time()) % 10000000}",
-                    workflow.id,
-                    WorkflowRunMode.SMARTFLO.value,
-                    user_id=workflow.user_id,
-                    call_type=CallType.INBOUND,
-                    initial_context=run_inputs.initial_context,
+            inbound_run = await db_client.create_workflow_run(
+                f"WR-SMARTFLO-IN-{int(time.time()) % 10000000}",
+                workflow.id,
+                WorkflowRunMode.SMARTFLO.value,
+                user_id=workflow.user_id,
+                call_type=CallType.INBOUND,
+                initial_context=run_inputs.initial_context,
+                organization_id=org_id,
+                definition_id=run_inputs.definition_id,
+            )
+            workflow_run_id_str = str(inbound_run.id)
+
+            if concurrency_slot:
+                try:
+                    await call_concurrency.bind_workflow_run(concurrency_slot, inbound_run.id)
+                except Exception as be:
+                    logger.warning(f"[Smartflo] Concurrency bind failed: {be}")
+
+            try:
+                quota_result = await authorize_workflow_run_start(
+                    workflow_id=workflow.id,
                     organization_id=org_id,
-                    definition_id=run_inputs.definition_id,
+                    workflow_run_id=inbound_run.id,
                 )
-                workflow_run_id_str = str(inbound_run.id)
-                logger.info(f"[Smartflo] Created dynamic inbound run {workflow_run_id_str} for agent {agent_id}")
+                if not quota_result.has_quota:
+                    logger.warning(f"[Smartflo] Inbound quota warning: {quota_result.error_message}")
+            except Exception as qe:
+                logger.warning(f"[Smartflo] Inbound quota check skipped/failed: {qe}")
+
+            if call_id:
+                await save_smartflo_call_state(
+                    ref_id=call_id,
+                    call_id=call_id,
+                    customer_number=caller_phone,
+                    state={
+                        "agent_id": str(target_agent or workflow.id),
+                        "workflow_id": workflow.id,
+                        "workflow_run_id": inbound_run.id,
+                        "organization_id": org_id,
+                        "customer_number": caller_phone,
+                        "caller_id": did_phone,
+                        "ref_id": call_id,
+                        "call_id": call_id,
+                        "direction": "inbound",
+                        "status": "initiated",
+                    },
+                )
+
+            logger.info(
+                f"[Smartflo] Initialized dynamic fresh INBOUND run {workflow_run_id_str} "
+                f"for agent '{target_agent or workflow.name}' (caller={caller_phone}, did={did_phone}, call_id={call_id})"
+            )
         except Exception as e:
-            logger.warning(f"[Smartflo] Agent resolution in connect endpoint failed: {e}")
+            logger.error(f"[Smartflo] Dynamic inbound run creation failed: {e}", exc_info=True)
 
     # Dynamically determine WebSocket host using incoming request headers
     host_header = request.headers.get("x-forwarded-host") or request.headers.get("host")
@@ -526,6 +605,10 @@ async def smartflo_direct_stream(
         workflow_run = await db_client.get_workflow_run_by_id(run_id_int)
         if not workflow_run:
             await websocket.close(code=4404, reason="Workflow run not found")
+            return
+        if workflow_run.is_completed:
+            logger.warning(f"[Smartflo] Workflow run {run_id_int} is already completed. Rejecting WebSocket.")
+            await websocket.close(code=4400, reason="Workflow run already completed")
             return
 
         workflow = await db_client.get_workflow_by_id(workflow_run.workflow_id)
