@@ -54,41 +54,52 @@ class MinioFileSystem(BaseFileSystem):
             endpoint, access_key=access_key, secret_key=secret_key, secure=secure
         )
 
+        # Policy for anonymous access
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                    "Resource": [f"arn:aws:s3:::{self.bucket_name}/*"],
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "*"},
+                    "Action": ["s3:ListBucket"],
+                    "Resource": [f"arn:aws:s3:::{self.bucket_name}"],
+                },
+            ],
+        }
+
         # Ensure bucket exists and configure anonymous access (using internal client)
         try:
             if not self.client.bucket_exists(self.bucket_name):
                 self.client.make_bucket(self.bucket_name)
 
-            # Set public read/write policy for local development
-            # This allows:
-            # 1. Anonymous downloads (s3:GetObject)
-            # 2. Anonymous uploads (s3:PutObject) - bypasses presigned URL signature issues
-            # 3. List bucket contents (s3:ListBucket) for debugging
-            # Note: This is set on every initialization to ensure policy is correct
-            # WARNING: Only use in local development, not production!
-            policy = {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"AWS": "*"},
-                        "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-                        "Resource": [f"arn:aws:s3:::{self.bucket_name}/*"],
-                    },
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"AWS": "*"},
-                        "Action": ["s3:ListBucket"],
-                        "Resource": [f"arn:aws:s3:::{self.bucket_name}"],
-                    },
-                ],
-            }
-
             self.client.set_bucket_policy(self.bucket_name, json.dumps(policy))
         except Exception as e:
-            # Bucket might already exist or we might be in a restricted environment
-            logger.debug(f"Bucket setup note: {e}")
-            pass
+            err_str = str(e).lower()
+            if self.secure and ("wrong_version_number" in err_str or "ssl" in err_str):
+                logger.warning(
+                    f"[MinIO] SSL error connecting to internal endpoint '{endpoint}' with secure=True. "
+                    f"The server is running plain HTTP. Auto-falling back to secure=False."
+                )
+                self.secure = False
+                self.client = Minio(
+                    endpoint, access_key=access_key, secret_key=secret_key, secure=False
+                )
+                try:
+                    if not self.client.bucket_exists(self.bucket_name):
+                        self.client.make_bucket(self.bucket_name)
+                    self.client.set_bucket_policy(self.bucket_name, json.dumps(policy))
+                except Exception as inner_e:
+                    logger.debug(f"Bucket setup note after HTTP fallback: {inner_e}")
+            else:
+                # Bucket might already exist or we might be in a restricted environment
+                logger.debug(f"Bucket setup note: {e}")
+                pass
 
     async def acreate_file(self, file_path: str, content: AsyncReadable) -> bool:
         try:
