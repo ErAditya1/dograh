@@ -3,7 +3,7 @@
 import json
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Body, HTTPException, Request, Response, WebSocket
 from loguru import logger
@@ -231,6 +231,108 @@ async def make_smartflo_call(call_details: dict = Body(...)) -> Dict[str, Any]:
     }
 
 
+async def create_smartflo_inbound_run(
+    *,
+    to_number: Optional[str] = None,
+    from_number: Optional[str] = None,
+    call_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+) -> Tuple[Any, int, str]:
+    """Helper to dynamically initialize and register an inbound workflow run."""
+    target_agent = agent_id
+    if not target_agent and to_number:
+        target_agent = await get_did_mapping(to_number)
+    if not target_agent:
+        target_agent = await get_default_agent_id()
+
+    workflow, org_id = await resolve_dograh_agent(str(target_agent or ""))
+
+    from api.services.workflow.run_creation import prepare_workflow_run_inputs
+
+    caller_phone = from_number or ""
+    did_phone = to_number or ""
+
+    run_inputs = await prepare_workflow_run_inputs(
+        db_client,
+        workflow,
+        initial_context={
+            "phone_number": caller_phone,
+            "called_number": did_phone,
+            "caller_number": caller_phone,
+            "direction": "inbound",
+            "provider": "smartflo",
+            "agent_id": str(target_agent or workflow.id),
+            "call_id": str(call_id or ""),
+        },
+        use_draft=False,
+        include_template_context=True,
+    )
+
+    concurrency_slot = None
+    try:
+        concurrency_slot = await call_concurrency.acquire_org_slot(
+            org_id,
+            source="inbound:smartflo",
+            timeout=0,
+        )
+    except Exception as ce:
+        logger.warning(f"[Smartflo] Concurrency acquire skipped/failed: {ce}")
+
+    inbound_run = await db_client.create_workflow_run(
+        f"WR-SMARTFLO-IN-{int(time.time()) % 10000000}",
+        workflow.id,
+        WorkflowRunMode.SMARTFLO.value,
+        user_id=workflow.user_id,
+        call_type=CallType.INBOUND,
+        initial_context=run_inputs.initial_context,
+        organization_id=org_id,
+        definition_id=run_inputs.definition_id,
+    )
+    workflow_run_id_str = str(inbound_run.id)
+
+    if concurrency_slot:
+        try:
+            await call_concurrency.bind_workflow_run(concurrency_slot, inbound_run.id)
+        except Exception as be:
+            logger.warning(f"[Smartflo] Concurrency bind failed: {be}")
+
+    try:
+        quota_result = await authorize_workflow_run_start(
+            workflow_id=workflow.id,
+            organization_id=org_id,
+            workflow_run_id=inbound_run.id,
+        )
+        if not quota_result.has_quota:
+            logger.warning(f"[Smartflo] Inbound quota warning: {quota_result.error_message}")
+    except Exception as qe:
+        logger.warning(f"[Smartflo] Inbound quota check skipped/failed: {qe}")
+
+    if call_id:
+        await save_smartflo_call_state(
+            ref_id=call_id,
+            call_id=call_id,
+            customer_number=caller_phone,
+            state={
+                "agent_id": str(target_agent or workflow.id),
+                "workflow_id": workflow.id,
+                "workflow_run_id": inbound_run.id,
+                "organization_id": org_id,
+                "customer_number": caller_phone,
+                "caller_id": did_phone,
+                "ref_id": call_id,
+                "call_id": call_id,
+                "direction": "inbound",
+                "status": "initiated",
+            },
+        )
+
+    logger.info(
+        f"[Smartflo] Initialized dynamic fresh INBOUND run {workflow_run_id_str} "
+        f"for agent '{target_agent or workflow.name}' (caller={caller_phone}, did={did_phone}, call_id={call_id})"
+    )
+    return workflow, org_id, workflow_run_id_str
+
+
 @router.api_route(
     "/smartflo_connect",
     methods=["GET", "POST"],
@@ -348,8 +450,6 @@ async def smartflo_connect(request: Request) -> Response:
         workflow_run_id_str = None
 
     # If not already bound to an active run, check Redis for an active outbound call
-    # Note: We deliberately do NOT match from_number here, because an inbound caller might have
-    # been the recipient of a past outbound call!
     cached_state = None
     if not workflow_run_id_str:
         for lookup_key in (call_id, custom_identifier, to_number):
@@ -379,99 +479,14 @@ async def smartflo_connect(request: Request) -> Response:
     # If we STILL don't have an active workflow_run_id, this is a fresh INBOUND call!
     if not workflow_run_id_str:
         try:
-            target_agent = agent_id
-            if not target_agent and to_number:
-                target_agent = await get_did_mapping(to_number)
-            if not target_agent:
-                target_agent = await get_default_agent_id()
-
-            workflow, org_id = await resolve_dograh_agent(str(target_agent or ""))
+            workflow, org_id, workflow_run_id_str = await create_smartflo_inbound_run(
+                to_number=to_number,
+                from_number=from_number,
+                call_id=call_id,
+                agent_id=agent_id,
+            )
             workflow_id_str = str(workflow.id)
             organization_id_str = str(org_id)
-
-            from api.services.workflow.run_creation import prepare_workflow_run_inputs
-
-            caller_phone = from_number or ""
-            did_phone = to_number or ""
-
-            run_inputs = await prepare_workflow_run_inputs(
-                db_client,
-                workflow,
-                initial_context={
-                    "phone_number": caller_phone,
-                    "called_number": did_phone,
-                    "caller_number": caller_phone,
-                    "direction": "inbound",
-                    "provider": "smartflo",
-                    "agent_id": str(target_agent or workflow.id),
-                    "call_id": str(call_id or ""),
-                },
-                use_draft=False,
-                include_template_context=True,
-            )
-
-            concurrency_slot = None
-            try:
-                concurrency_slot = await call_concurrency.acquire_org_slot(
-                    org_id,
-                    source="inbound:smartflo",
-                    timeout=0,
-                )
-            except Exception as ce:
-                logger.warning(f"[Smartflo] Concurrency acquire skipped/failed: {ce}")
-
-            inbound_run = await db_client.create_workflow_run(
-                f"WR-SMARTFLO-IN-{int(time.time()) % 10000000}",
-                workflow.id,
-                WorkflowRunMode.SMARTFLO.value,
-                user_id=workflow.user_id,
-                call_type=CallType.INBOUND,
-                initial_context=run_inputs.initial_context,
-                organization_id=org_id,
-                definition_id=run_inputs.definition_id,
-            )
-            workflow_run_id_str = str(inbound_run.id)
-
-            if concurrency_slot:
-                try:
-                    await call_concurrency.bind_workflow_run(concurrency_slot, inbound_run.id)
-                except Exception as be:
-                    logger.warning(f"[Smartflo] Concurrency bind failed: {be}")
-
-            try:
-                quota_result = await authorize_workflow_run_start(
-                    workflow_id=workflow.id,
-                    organization_id=org_id,
-                    workflow_run_id=inbound_run.id,
-                )
-                if not quota_result.has_quota:
-                    logger.warning(f"[Smartflo] Inbound quota warning: {quota_result.error_message}")
-            except Exception as qe:
-                logger.warning(f"[Smartflo] Inbound quota check skipped/failed: {qe}")
-
-            if call_id:
-                await save_smartflo_call_state(
-                    ref_id=call_id,
-                    call_id=call_id,
-                    customer_number=caller_phone,
-                    state={
-                        "agent_id": str(target_agent or workflow.id),
-                        "workflow_id": workflow.id,
-                        "workflow_run_id": inbound_run.id,
-                        "organization_id": org_id,
-                        "customer_number": caller_phone,
-                        "caller_id": did_phone,
-                        "ref_id": call_id,
-                        "call_id": call_id,
-                        "direction": "inbound",
-                        "status": "initiated",
-                    },
-                )
-
-            logger.info(
-                f"[Smartflo] Initialized dynamic fresh INBOUND run {workflow_run_id_str} "
-                f"for agent '{target_agent or workflow.name}' (caller={caller_phone}, did={did_phone}, call_id={call_id})"
-            )
         except Exception as e:
             logger.error(f"[Smartflo] Dynamic inbound run creation failed: {e}", exc_info=True)
 
