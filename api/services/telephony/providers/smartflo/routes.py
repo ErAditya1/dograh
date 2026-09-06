@@ -588,8 +588,14 @@ async def smartflo_direct_stream(
     if not run_id:
         latest = await get_smartflo_latest_call()
         if latest and latest.get("workflow_run_id"):
-            run_id = latest.get("workflow_run_id")
-            logger.info(f"[Smartflo] Direct stream bound to latest active call run_id={run_id}")
+            cand_id = latest.get("workflow_run_id")
+            try:
+                cand_obj = await db_client.get_workflow_run_by_id(int(cand_id))
+                if cand_obj and not cand_obj.is_completed:
+                    run_id = cand_id
+                    logger.info(f"[Smartflo] Direct stream bound to latest active call run_id={run_id}")
+            except Exception:
+                pass
 
     if not run_id:
         logger.info("[Smartflo] WebSocket connected in test/probe mode (no workflow_run_id). Socket accepted.")
