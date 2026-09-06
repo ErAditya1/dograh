@@ -235,6 +235,14 @@ async def make_smartflo_call(call_details: dict = Body(...)) -> Dict[str, Any]:
     "/smartflo_connect",
     methods=["GET", "POST"],
 )
+@router.api_route(
+    "/api/v1/telephony/smartflo_connect",
+    methods=["GET", "POST"],
+)
+@router.api_route(
+    "/smartflo/connect",
+    methods=["GET", "POST"],
+)
 async def smartflo_connect(request: Request) -> Response:
     """
     Dynamic endpoint called by Smartflo Voice Bot to obtain WebSocket streaming URL.
@@ -465,6 +473,9 @@ async def handle_smartflo_events(
 @router.websocket("/smartflo/stream/{workflow_run_id}")
 @router.websocket("/stream")
 @router.websocket("/stream/{workflow_run_id}")
+@router.websocket("/api/v1/telephony/stream")
+@router.websocket("/api/v1/telephony/stream/{workflow_run_id}")
+@router.websocket("/api/v1/telephony/smartflo/stream")
 async def smartflo_direct_stream(
     websocket: WebSocket,
     workflow_run_id: Optional[int] = None,
