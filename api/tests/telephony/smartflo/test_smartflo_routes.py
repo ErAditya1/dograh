@@ -69,6 +69,28 @@ async def test_smartflo_connect_endpoint_resolution():
             assert "/stream?token=88" in data_redis["url"]
 
 
+        # 4. Resolution via Fallback to Latest Active Call (Zero-param Smartflo Webhook)
+        latest_state = {
+            "workflow_id": 77,
+            "organization_id": 1,
+            "workflow_run_id": 999,
+            "agent_id": "agent_latest",
+        }
+        with patch(
+            "api.services.telephony.providers.smartflo.routes.get_smartflo_call_state",
+            new_callable=AsyncMock,
+            return_value=None,
+        ), patch(
+            "api.services.telephony.providers.smartflo.routes.get_smartflo_latest_call",
+            new_callable=AsyncMock,
+            return_value=latest_state,
+        ):
+            resp_zero = await client.post("/smartflo_connect", json={})
+            assert resp_zero.status_code == 200
+            data_zero = resp_zero.json()
+            assert "/stream?token=999" in data_zero["url"]
+
+
 @pytest.mark.asyncio
 async def test_smartflo_events_webhook():
     transport = ASGITransport(app=app)

@@ -54,6 +54,9 @@ async def save_smartflo_call_state(
         except Exception as e:
             logger.warning(f"Failed to cache Smartflo call state on key {k}: {e}")
 
+    # Always register as latest active call for zero-param webhook fallback
+    await save_smartflo_latest_call(state, ttl=120)
+
 
 async def get_smartflo_call_state(identifier: str) -> Optional[Dict[str, Any]]:
     """Retrieve call state by ref_id, call_id, or phone number."""
@@ -103,6 +106,27 @@ async def delete_smartflo_call_state(
             await client.delete(k)
         except Exception as e:
             logger.debug(f"Redis cleanup error for {k}: {e}")
+
+
+async def save_smartflo_latest_call(state: Dict[str, Any], ttl: int = 120) -> None:
+    """Save the most recently initiated Smartflo call for zero-param webhook matching."""
+    client = get_redis_client()
+    try:
+        await client.set("smartflo:latest_call", json.dumps(state), ex=ttl)
+    except Exception as e:
+        logger.warning(f"Failed to cache latest Smartflo call: {e}")
+
+
+async def get_smartflo_latest_call() -> Optional[Dict[str, Any]]:
+    """Retrieve the most recently initiated Smartflo call if within TTL (e.g. 120s)."""
+    client = get_redis_client()
+    try:
+        raw = await client.get("smartflo:latest_call")
+        if raw:
+            return json.loads(raw)
+    except Exception as e:
+        logger.warning(f"Failed to get latest Smartflo call: {e}")
+    return None
 
 
 async def get_did_mapping(to_number: Optional[str]) -> Optional[str]:

@@ -54,6 +54,7 @@ class SmartfloFrameSerializer(FrameSerializer):
 
         self._input_resampler = create_stream_resampler()
         self._output_resampler = create_stream_resampler()
+        self._chunk_counter = 0
 
     def set_stream_sid(self, stream_sid: str) -> None:
         self._stream_sid = stream_sid
@@ -106,12 +107,14 @@ class SmartfloFrameSerializer(FrameSerializer):
             if not encoded_bytes:
                 return None
 
+            self._chunk_counter += 1
             b64_payload = base64.b64encode(encoded_bytes).decode("ascii")
             msg = {
                 "event": "media",
                 "streamSid": self._stream_sid,
                 "media": {
                     "payload": b64_payload,
+                    "chunk": self._chunk_counter,
                 },
             }
             return json.dumps(msg)

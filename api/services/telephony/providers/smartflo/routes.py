@@ -27,6 +27,7 @@ from api.services.telephony.providers.smartflo.redis_state import (
     get_default_agent_id,
     get_did_mapping,
     get_smartflo_call_state,
+    get_smartflo_latest_call,
     save_smartflo_call_state,
 )
 from api.services.telephony.status_processor import (
@@ -301,13 +302,29 @@ async def smartflo_connect(request: Request) -> Response:
     workflow_run_id_str = params.get("workflow_run_id") or body_data.get("workflow_run_id")
     organization_id_str = params.get("organization_id") or body_data.get("organization_id")
 
-    # If IDs missing, lookup in Redis by call_id, custom_identifier, or to_number
+    logger.info(
+        f"[Smartflo] /smartflo_connect invoked: method={request.method}, "
+        f"query={params}, body={body_data}"
+    )
+
+    # If IDs missing, lookup in Redis by call_id, custom_identifier, to_number, from_number
     cached_state = None
-    for lookup_key in (call_id, custom_identifier, to_number):
+    for lookup_key in (call_id, custom_identifier, to_number, from_number, agent_id):
         if lookup_key:
             cached_state = await get_smartflo_call_state(str(lookup_key))
             if cached_state:
+                logger.info(f"[Smartflo] Resolved call state via key: {lookup_key}")
                 break
+
+    # Fail-safe: If Smartflo called connect without identifiers, fall back to the most recent outbound call
+    if not cached_state:
+        latest = await get_smartflo_latest_call()
+        if latest and latest.get("workflow_run_id"):
+            cached_state = latest
+            logger.info(
+                f"[Smartflo] Resolved call state via latest active outbound call: "
+                f"run_id={cached_state.get('workflow_run_id')}, call_id={cached_state.get('call_id')}"
+            )
 
     if cached_state:
         workflow_id_str = workflow_id_str or cached_state.get("workflow_id")
@@ -459,6 +476,13 @@ async def smartflo_direct_stream(
     if not run_id:
         qp = websocket.query_params
         run_id = qp.get("workflow_run_id") or qp.get("run_id") or qp.get("token")
+
+    # If connected without token, check if there's a recent active outbound call in Redis
+    if not run_id:
+        latest = await get_smartflo_latest_call()
+        if latest and latest.get("workflow_run_id"):
+            run_id = latest.get("workflow_run_id")
+            logger.info(f"[Smartflo] Direct stream bound to latest active call run_id={run_id}")
 
     if not run_id:
         logger.info("[Smartflo] WebSocket connected in test/probe mode (no workflow_run_id). Socket accepted.")
