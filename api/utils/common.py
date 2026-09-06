@@ -157,9 +157,8 @@ async def get_backend_endpoints() -> tuple[str, str]:
         _validate_url(BACKEND_API_ENDPOINT)
 
     if BACKEND_API_ENDPOINT:
-        # Non-public address (localhost or a private/reserved IP) - the host isn't
-        # reachable from the internet, so prefer a running Cloudflare tunnel's URL.
-        if is_local_or_private_url(BACKEND_API_ENDPOINT):
+        # Non-public address or dynamic trycloudflare URL - prefer the live active Cloudflare tunnel URL.
+        if is_local_or_private_url(BACKEND_API_ENDPOINT) or "trycloudflare.com" in (BACKEND_API_ENDPOINT or ""):
             logger.debug(
                 f"BACKEND_API_ENDPOINT is not publicly reachable ({BACKEND_API_ENDPOINT}), checking tunnel URL"
             )

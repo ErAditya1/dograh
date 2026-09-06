@@ -45,44 +45,52 @@ class TunnelURLProvider:
             Optional[tuple[str, str]]: (https_url, wss_url) with full protocols, or None if not found
         """
         try:
-            # Try to connect to cloudflared metrics endpoint
-            # The service name in docker-compose is 'cloudflared'
-            metrics_url = "http://cloudflared:2000/metrics"
+            # Try to connect to cloudflared metrics / quicktunnel endpoints
+            # Works in both Docker (cloudflared:2000) and Local Windows (127.0.0.1:20241, localhost:2000)
+            candidate_endpoints = [
+                "http://127.0.0.1:20241/quicktunnel",
+                "http://cloudflared:2000/metrics",
+                "http://127.0.0.1:20241/metrics",
+                "http://localhost:2000/metrics",
+            ]
 
             async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    metrics_url, timeout=aiohttp.ClientTimeout(total=5)
-                ) as response:
-                    if response.status != 200:
-                        logger.warning(
-                            f"Cloudflared metrics returned status {response.status}"
-                        )
-                        return None
+                for ep in candidate_endpoints:
+                    try:
+                        async with session.get(
+                            ep, timeout=aiohttp.ClientTimeout(total=2)
+                        ) as response:
+                            if response.status != 200:
+                                continue
+                            text = await response.text()
+                            # Handle quicktunnel JSON response {"hostname":"..."}
+                            if "hostname" in text and "{" in text:
+                                import json
+                                try:
+                                    j = json.loads(text)
+                                    h = j.get("hostname")
+                                    if h:
+                                        h = h.replace("https://", "").replace("wss://", "")
+                                        return f"https://{h}", f"wss://{h}"
+                                except Exception:
+                                    pass
 
-                    text = await response.text()
+                            # Look for the tunnel URL in metrics userHostname
+                            match = re.search(r'userHostname="([^"]+)"', text)
+                            if match:
+                                hostname = match.group(1).replace("https://", "").replace("wss://", "")
+                                return f"https://{hostname}", f"wss://{hostname}"
 
-                    # Look for the tunnel URL in metrics
-                    # Cloudflared exposes this in the userHostname metric
-                    match = re.search(r'userHostname="([^"]+)"', text)
-                    if match:
-                        hostname = match.group(1)
-                        # Remove https:// or wss:// if present
-                        hostname = hostname.replace("https://", "").replace(
-                            "wss://", ""
-                        )
-                        return "https://" + hostname, "wss://" + hostname
+                            # Alternative: Look for trycloudflare.com domain
+                            match = re.search(r"([a-z0-9-]+\.trycloudflare\.com)", text)
+                            if match:
+                                hostname = match.group(1).replace("https://", "").replace("wss://", "")
+                                return f"https://{hostname}", f"wss://{hostname}"
+                    except Exception:
+                        continue
 
-                    # Alternative: Look for trycloudflare.com domain
-                    match = re.search(r"([a-z0-9-]+\.trycloudflare\.com)", text)
-                    if match:
-                        hostname = match.group(1)
-                        hostname = hostname.replace("https://", "").replace(
-                            "wss://", ""
-                        )
-                        return f"https://{hostname}", f"wss://{hostname}"
-
-                    logger.warning("Could not find tunnel URL in cloudflared metrics")
-                    return None
+            logger.warning("Could not find active tunnel URL from any cloudflared endpoints")
+            return None
 
         except asyncio.TimeoutError:
             logger.warning("Timeout connecting to cloudflared metrics endpoint")
