@@ -202,3 +202,205 @@ async def get_workflow_runs(
         limit=limit,
         total_pages=total_pages,
     )
+
+
+@router.get("/stats")
+async def get_stats(
+    user: UserModel = Depends(get_superuser),
+):
+    """Get live platform-wide KPIs and stats from the PostgreSQL database."""
+    return await db_client.get_platform_stats()
+
+
+@router.get("/clients")
+async def get_clients(
+    user: UserModel = Depends(get_superuser),
+):
+    """Get all registered client organizations with real member emails and call metrics."""
+    return await db_client.get_all_organizations_with_stats()
+
+
+class GrantCreditsRequest(BaseModel):
+    amount: float
+
+
+@router.post("/clients/{client_id}/grant-credits")
+async def grant_credits(
+    client_id: int,
+    request: GrantCreditsRequest,
+    user: UserModel = Depends(get_superuser),
+):
+    """Grant credits to a specific client organization."""
+    if request.amount <= 0:
+        raise HTTPException(status_code=400, detail="Credit amount must be greater than 0")
+    new_balance = await db_client.grant_organization_credits(client_id, request.amount)
+    return {"status": "success", "organization_id": client_id, "new_balance": new_balance}
+
+
+@router.get("/provider-keys")
+async def get_provider_keys(
+    user: UserModel = Depends(get_superuser),
+):
+    """Get live configured AI and Telephony providers across the platform."""
+    from sqlalchemy.future import select
+    from api.db.models import OrganizationConfigurationModel, TelephonyConfigurationModel
+
+    keys = []
+    async with db_client.async_session() as session:
+        # 1. Model configuration (STT, LLM, TTS)
+        model_conf = (
+            await session.execute(
+                select(OrganizationConfigurationModel).where(
+                    OrganizationConfigurationModel.key == "MODEL_CONFIGURATION_V2"
+                )
+            )
+        ).scalars().first()
+
+        if model_conf and isinstance(model_conf.value, dict):
+            pipe = model_conf.value.get("byok", {}).get("pipeline", {})
+            stt = pipe.get("stt", {})
+            if stt:
+                raw_k = stt.get("api_key", [""])[0] if isinstance(stt.get("api_key"), list) else str(stt.get("api_key", ""))
+                masked = (raw_k[:6] + "..." + raw_k[-4:]) if len(raw_k) > 10 else (raw_k or "Configured in Environment")
+                keys.append({
+                    "id": "key_stt",
+                    "provider": f"{stt.get('provider', 'Deepgram').capitalize()} STT",
+                    "category": "Speech-to-Text",
+                    "maskedKey": masked,
+                    "model": stt.get("model", "nova-3-general"),
+                    "isConfigured": True,
+                    "isActive": True,
+                })
+
+            llm = pipe.get("llm", {})
+            if llm:
+                raw_k = llm.get("api_key", [""])[0] if isinstance(llm.get("api_key"), list) else str(llm.get("api_key", ""))
+                masked = (raw_k[:6] + "..." + raw_k[-4:]) if len(raw_k) > 10 else (raw_k or "Configured in Environment")
+                keys.append({
+                    "id": "key_llm",
+                    "provider": f"{llm.get('provider', 'Groq').capitalize()} LLM",
+                    "category": "Language Model",
+                    "maskedKey": masked,
+                    "model": llm.get("model", "openai/gpt-oss-120b"),
+                    "isConfigured": True,
+                    "isActive": True,
+                })
+
+            tts = pipe.get("tts", {})
+            if tts:
+                raw_k = tts.get("api_key", [""])[0] if isinstance(tts.get("api_key"), list) else str(tts.get("api_key", ""))
+                masked = (raw_k[:6] + "..." + raw_k[-4:]) if len(raw_k) > 10 else (raw_k or "Configured in Environment")
+                keys.append({
+                    "id": "key_tts",
+                    "provider": f"{tts.get('provider', 'Rumik').capitalize()} Silk TTS",
+                    "category": "Text-to-Speech",
+                    "maskedKey": masked,
+                    "model": tts.get("model", "muga"),
+                    "voice": tts.get("voice", "friendly conversational male, Indian accent"),
+                    "isConfigured": True,
+                    "isActive": True,
+                })
+
+        # 2. Telephony Configurations
+        telephony_res = await session.execute(select(TelephonyConfigurationModel))
+        telephony_configs = telephony_res.scalars().all()
+        for t_cfg in telephony_configs:
+            creds = t_cfg.credentials or {}
+            key_preview = ""
+            if "auth_token" in creds:
+                tok = str(creds["auth_token"])
+                key_preview = tok[:5] + "..." + tok[-3:] if len(tok) > 8 else tok
+            elif "jwt_token" in creds:
+                tok = str(creds["jwt_token"])
+                key_preview = tok[:8] + "..." + tok[-4:] if len(tok) > 12 else tok
+            elif "api_key" in creds:
+                tok = str(creds["api_key"])
+                key_preview = tok[:6] + "..." + tok[-3:] if len(tok) > 9 else tok
+            else:
+                key_preview = "Active Credentials"
+
+            keys.append({
+                "id": f"key_telephony_{t_cfg.id}",
+                "provider": f"{t_cfg.name} ({t_cfg.provider.capitalize()})",
+                "category": "Telephony Carrier",
+                "maskedKey": key_preview,
+                "model": "Default Outbound" if t_cfg.is_default_outbound else "Secondary",
+                "isConfigured": not t_cfg.inactive,
+                "isActive": not t_cfg.inactive,
+            })
+
+    return keys
+
+
+@router.get("/phone-numbers")
+async def get_all_phone_numbers(
+    user: UserModel = Depends(get_superuser),
+):
+    """Get all phone numbers: both platform inventory numbers and tenant-registered numbers."""
+    from sqlalchemy.future import select
+    from api.db.models import (
+        PlatformInventoryNumberModel,
+        TelephonyPhoneNumberModel,
+        TelephonyConfigurationModel,
+        OrganizationModel,
+    )
+
+    async with db_client.async_session() as session:
+        # Platform inventory numbers
+        inv_res = await session.execute(
+            select(PlatformInventoryNumberModel).order_by(PlatformInventoryNumberModel.created_at.desc())
+        )
+        inv_numbers = inv_res.scalars().all()
+        inventory_list = [
+            {
+                "id": str(n.id),
+                "phone_number": n.phone_number,
+                "carrier": n.carrier,
+                "number_type": n.number_type,
+                "monthly_cost": n.monthly_cost / 100.0 if n.monthly_cost else 0.0,
+                "status": n.status,
+                "created_at": n.created_at.isoformat() if n.created_at else None,
+                "assigned_organization_id": n.assigned_organization_id,
+                "provider_credentials": n.provider_credentials or {},
+            }
+            for n in inv_numbers
+        ]
+
+        # Tenant numbers
+        tenant_query = (
+            select(
+                TelephonyPhoneNumberModel,
+                TelephonyConfigurationModel.name.label("config_name"),
+                TelephonyConfigurationModel.provider.label("provider_name"),
+                OrganizationModel.provider_id.label("org_provider_id"),
+            )
+            .join(
+                TelephonyConfigurationModel,
+                TelephonyPhoneNumberModel.telephony_configuration_id == TelephonyConfigurationModel.id,
+            )
+            .join(
+                OrganizationModel,
+                TelephonyPhoneNumberModel.organization_id == OrganizationModel.id,
+            )
+        )
+        tenant_res = await session.execute(tenant_query)
+        tenant_list = []
+        for row in tenant_res.all():
+            phone, cfg_name, prov, org_pid = row
+            tenant_list.append({
+                "id": str(phone.id),
+                "phone_number": phone.address,
+                "carrier": prov,
+                "configuration_name": cfg_name,
+                "organization_id": phone.organization_id,
+                "organization_name": org_pid,
+                "is_active": phone.is_active,
+                "is_default_caller_id": phone.is_default_caller_id,
+                "created_at": phone.created_at.isoformat() if phone.created_at else None,
+            })
+
+    return {
+        "inventory": inventory_list,
+        "tenant_numbers": tenant_list,
+    }
+

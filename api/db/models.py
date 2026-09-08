@@ -1536,3 +1536,36 @@ class KnowledgeBaseChunkModel(Base):
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
     )
+
+
+class PlatformInventoryNumberModel(Base):
+    """Platform phone numbers inventory for shared trials and dedicated purchasing."""
+
+    __tablename__ = "platform_inventory_numbers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone_number = Column(String(64), nullable=False, unique=True, index=True)
+    provider = Column(String(32), nullable=False)  # twilio, smartflo, telnyx, vonage, plivo
+    carrier = Column(String(64), nullable=False)   # Twilio, Tata Smartflo, Telnyx, etc.
+    number_type = Column(String(32), nullable=False, default="shared_trial")  # shared_trial, dedicated
+    country_code = Column(String(8), nullable=False, default="US")
+    monthly_cost = Column(Float, nullable=False, default=0.0)
+    status = Column(String(32), nullable=False, default="available")  # available, in_use, shared_pool
+    provider_config = Column(JSON, nullable=False, default=dict)
+    assigned_organization_id = Column(
+        Integer, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    assigned_organization = relationship("OrganizationModel")
+
+    __table_args__ = (
+        Index("ix_platform_numbers_status", "status"),
+        Index("ix_platform_numbers_type", "number_type"),
+    )
+

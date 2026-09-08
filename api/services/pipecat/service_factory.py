@@ -913,6 +913,43 @@ def create_tts_service(
             skip_aggregator_types=["recording_router", "recording"],
             silence_time_s=1.0,
         )
+    elif user_config.tts.provider == ServiceProviders.RUMIK.value:
+        from pipecat_rumik import RumikTTSService, RumikTTSSettings
+
+        raw_api_key = user_config.tts.api_key
+        api_key = (
+            raw_api_key[0]
+            if isinstance(raw_api_key, (list, tuple))
+            else (raw_api_key or "")
+        )
+        voice = (
+            getattr(user_config.tts, "voice", None)
+            or "friendly conversational male, Indian accent"
+        )
+        model = getattr(user_config.tts, "model", None) or "muga"
+        base_url = (
+            getattr(user_config.tts, "base_url", None)
+            or "https://silk-api.rumik.ai"
+        )
+        if base_url.startswith("wss://"):
+            base_url = base_url.replace("wss://", "https://")
+        elif base_url.startswith("ws://"):
+            base_url = base_url.replace("ws://", "http://")
+        gateway_url = base_url.split("/v1")[0].rstrip("/")
+        _validate_runtime_service_url(gateway_url, "base_url")
+
+        return RumikTTSService(
+            api_key=api_key,
+            gateway_url=gateway_url,
+            settings=RumikTTSSettings(
+                model=model,
+                voice=voice,
+                description=voice,
+            ),
+            text_filters=[xml_function_tag_filter],
+            skip_aggregator_types=["recording_router", "recording"],
+            silence_time_s=1.0,
+        )
     else:
         raise HTTPException(
             status_code=400, detail=f"Invalid TTS provider {user_config.tts.provider}"

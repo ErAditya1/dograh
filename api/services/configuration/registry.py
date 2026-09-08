@@ -39,6 +39,9 @@ from api.services.configuration.options import (
     GOOGLE_VERTEX_REALTIME_LANGUAGES,
     GOOGLE_VERTEX_REALTIME_MODELS,
     GOOGLE_VERTEX_REALTIME_VOICES,
+    RUMIK_TTS_LANGUAGES,
+    RUMIK_TTS_MODELS,
+    RUMIK_TTS_VOICE_PRESETS,
     SARVAM_LANGUAGES,
     SARVAM_LLM_MODELS,
     SARVAM_STT_LANGUAGES_V3,
@@ -98,6 +101,7 @@ class ServiceProviders(str, Enum):
     SMALLEST = "smallest"
     XAI = "xai"
     LMNT = "lmnt"
+    RUMIK = "rumik"
 
 
 class BaseServiceConfiguration(BaseModel):
@@ -131,6 +135,7 @@ class BaseServiceConfiguration(BaseModel):
         ServiceProviders.SMALLEST,
         ServiceProviders.XAI,
         ServiceProviders.LMNT,
+        ServiceProviders.RUMIK,
     ]
     api_key: str | list[str]
 
@@ -315,6 +320,11 @@ ELEVENLABS_PROVIDER_MODEL_CONFIG = provider_model_config("ElevenLabs")
 CARTESIA_PROVIDER_MODEL_CONFIG = provider_model_config("Cartesia")
 XAI_PROVIDER_MODEL_CONFIG = provider_model_config("xAI")
 LMNT_PROVIDER_MODEL_CONFIG = provider_model_config("LMNT")
+RUMIK_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Rumik AI",
+    description="Rumik AI Silk streaming expressive multilingual Text-to-Speech API.",
+    provider_docs_url="https://silk-api.rumik.ai",
+)
 INWORLD_PROVIDER_MODEL_CONFIG = provider_model_config(
     "Inworld",
     description=(
@@ -1459,6 +1469,37 @@ class LmntTTSConfiguration(BaseTTSConfiguration):
     )
 
 
+@register_tts
+class RumikTTSConfiguration(BaseTTSConfiguration):
+    model_config = RUMIK_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.RUMIK] = ServiceProviders.RUMIK
+    model: str = Field(
+        default="mulberry",
+        description="Rumik streaming model. 'mulberry' for ultra-low-latency voice description steering, 'muga' for expressive tone tags.",
+        json_schema_extra={"examples": list(RUMIK_TTS_MODELS)},
+    )
+    voice: str = Field(
+        default="warm professional female, Indian accent",
+        description="Rumik voice description prompt or voice name.",
+        json_schema_extra={
+            "examples": list(RUMIK_TTS_VOICE_PRESETS),
+            "allow_custom_input": True,
+        },
+    )
+    language: str = Field(
+        default="hi",
+        description="Language code for Rumik Silk synthesis (e.g. 'hi', 'en', 'hinglish', 'ta', 'te', 'bn', 'mr', 'gu', 'kn').",
+        json_schema_extra={
+            "examples": list(RUMIK_TTS_LANGUAGES),
+            "allow_custom_input": True,
+        },
+    )
+    base_url: str = Field(
+        default="https://silk-api.rumik.ai",
+        description="Rumik Silk gateway endpoint.",
+    )
+
+
 TTSConfig = Annotated[
     Union[
         DeepgramTTSConfiguration,
@@ -1477,6 +1518,7 @@ TTSConfig = Annotated[
         SmallestAITTSConfiguration,
         XAITTSConfiguration,
         LmntTTSConfiguration,
+        RumikTTSConfiguration,
     ],
     Field(discriminator="provider"),
 ]

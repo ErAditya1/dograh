@@ -107,4 +107,5 @@ export const LANGUAGE_DISPLAY_NAMES: Record<string, string> = {
     "brx-IN": "Bodo",
     "mai-IN": "Maithili",
     "doi-IN": "Dogri",
+    "hinglish": "Hinglish (Hindi + English)",
 };
