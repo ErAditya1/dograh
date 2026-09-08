@@ -211,9 +211,14 @@ def _create_realtime_user_turn_config(provider: str):
     """Return user turn strategies and optional local VAD for realtime providers."""
 
     def external_provider_turn_config():
+        # Since pipecat 1.8 these services propose turn boundaries
+        # (Proposed*SpeakingFrame) instead of announcing them, and no longer
+        # broadcast the barge-in themselves — the start strategy resolving the
+        # proposal owns it. Interruptions must therefore be enabled here, or
+        # nothing in the pipeline would broadcast them.
         return (
             UserTurnStrategies(
-                start=[ExternalUserTurnStartStrategy()],
+                start=[ExternalUserTurnStartStrategy(enable_interruptions=True)],
                 stop=[ExternalUserTurnStopStrategy(wait_for_transcript=False)],
             ),
             None,
@@ -233,8 +238,9 @@ def _create_realtime_user_turn_config(provider: str):
     if provider in {
         ServiceProviders.GOOGLE_REALTIME.value,
         ServiceProviders.GOOGLE_VERTEX_REALTIME.value,
+        ServiceProviders.AWS_NOVA_SONIC.value,
     }:
-        # Let Gemini Live own barge-in via its server-side VAD, but keep local
+        # Let the provider own barge-in via its server-side VAD, but keep local
         # Silero VAD for early user-turn start and speaking-state tracking.
         return local_vad_turn_config(enable_interruptions=False)
 
