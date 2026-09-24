@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
+from loguru import logger
 from sqlalchemy import exists
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.future import select
@@ -65,7 +66,10 @@ class OrganizationClient(BaseDBClient):
                 # This is atomic and handles race conditions at the database level
 
                 stmt = insert(OrganizationModel.__table__).values(
-                    provider_id=org_provider_id, created_at=datetime.now(timezone.utc)
+                    provider_id=org_provider_id,
+                    created_at=datetime.now(timezone.utc),
+                    subscription_tier="simple_trial",
+                    wallet_balance_usd=0.0,
                 )
                 # ON CONFLICT DO NOTHING - if another request already inserted, this becomes a no-op
                 stmt = stmt.on_conflict_do_nothing(index_elements=["provider_id"])
@@ -91,11 +95,13 @@ class OrganizationClient(BaseDBClient):
 
                 # Only create API key if we actually created the organization
                 if was_created:
+                    org_id = organization.id
+
                     # Create a default API key for the new organization
                     _, key_hash, key_prefix = generate_api_key()
 
                     api_key = APIKeyModel(
-                        organization_id=organization.id,
+                        organization_id=org_id,
                         name="Default API Key",
                         key_hash=key_hash,
                         key_prefix=key_prefix,
@@ -104,6 +110,12 @@ class OrganizationClient(BaseDBClient):
                     )
                     session.add(api_key)
                     await session.commit()
+
+                    try:
+                        from api.services.plan_service import plan_service
+                        await plan_service.assign_organization_plan(org_id, "simple_trial")
+                    except Exception as e:
+                        logger.warning("Could not auto-assign simple_trial plan: {}", e)
 
                 await session.refresh(organization)
                 return organization, was_created
@@ -148,3 +160,45 @@ class OrganizationClient(BaseDBClient):
 
             await session.execute(stmt)
             await session.commit()
+
+    async def get_wallet_balance(self, organization_id: int) -> float:
+        """Get the current wallet balance in USD for an organization."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(OrganizationModel.wallet_balance_usd).where(
+                    OrganizationModel.id == organization_id
+                )
+            )
+            val = result.scalar()
+            return float(val) if val is not None else 0.0
+
+    async def update_wallet_balance(
+        self, organization_id: int, delta_usd: float
+    ) -> float:
+        """Atomically update organization wallet balance by delta_usd (can be positive or negative).
+
+        Returns the updated wallet balance in USD.
+        """
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(OrganizationModel).where(OrganizationModel.id == organization_id)
+            )
+            org = result.scalars().first()
+            if not org:
+                raise ValueError(f"Organization {organization_id} not found")
+
+            current_bal = float(org.wallet_balance_usd or 0.0)
+            new_bal = round(current_bal + delta_usd, 4)
+            org.wallet_balance_usd = new_bal
+            session.add(org)
+            await session.commit()
+            await session.refresh(org)
+            return float(org.wallet_balance_usd)
+
+    async def list_all_organizations(self) -> list[OrganizationModel]:
+        """List all organizations with their wallet balances."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(OrganizationModel).order_by(OrganizationModel.id.desc())
+            )
+            return list(result.scalars().all())

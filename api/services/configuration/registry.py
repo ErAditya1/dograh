@@ -48,6 +48,9 @@ from api.services.configuration.options import (
     GOOGLE_VERTEX_REALTIME_LANGUAGES,
     GOOGLE_VERTEX_REALTIME_MODELS,
     GOOGLE_VERTEX_REALTIME_VOICES,
+    RUMIK_TTS_LANGUAGES,
+    RUMIK_TTS_MODELS,
+    RUMIK_TTS_VOICE_PRESETS,
     SARVAM_LANGUAGES,
     SARVAM_LLM_MODELS,
     SARVAM_STT_LANGUAGES_V3,
@@ -112,6 +115,7 @@ class ServiceProviders(str, Enum):
     SMALLEST = "smallest"
     XAI = "xai"
     LMNT = "lmnt"
+    RUMIK = "rumik"
     SPEECHIFY = "speechify"
 
 
@@ -147,9 +151,10 @@ class BaseServiceConfiguration(BaseModel):
         ServiceProviders.SMALLEST,
         ServiceProviders.XAI,
         ServiceProviders.LMNT,
+        ServiceProviders.RUMIK,
         ServiceProviders.SPEECHIFY,
     ]
-    api_key: str | list[str]
+    api_key: str | list[str] = ""
 
     @field_validator("api_key")
     @classmethod
@@ -332,6 +337,11 @@ ELEVENLABS_PROVIDER_MODEL_CONFIG = provider_model_config("ElevenLabs")
 CARTESIA_PROVIDER_MODEL_CONFIG = provider_model_config("Cartesia")
 XAI_PROVIDER_MODEL_CONFIG = provider_model_config("xAI")
 LMNT_PROVIDER_MODEL_CONFIG = provider_model_config("LMNT")
+RUMIK_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Rumik AI",
+    description="Rumik AI Silk streaming expressive multilingual Text-to-Speech API.",
+    provider_docs_url="https://silk-api.rumik.ai",
+)
 SPEECHIFY_PROVIDER_MODEL_CONFIG = provider_model_config(
     "Speechify",
     provider_docs_url="https://docs.speechify.ai",
@@ -402,14 +412,13 @@ ATLASCLOUD_MODELS = [
 ]
 
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+    "llama-3.1-8b-instant",
     "deepseek-r1-distill-llama-70b",
     "qwen-qwq-32b",
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
     "gemma2-9b-it",
-    "llama-3.1-8b-instant",
-    "openai/gpt-oss-120b",
 ]
 OPENROUTER_MODELS = [
     "openai/gpt-4.1",
@@ -520,7 +529,7 @@ class GroqLLMService(BaseLLMConfiguration):
     model_config = GROQ_PROVIDER_MODEL_CONFIG
     provider: Literal[ServiceProviders.GROQ] = ServiceProviders.GROQ
     model: str = Field(
-        default="llama-3.3-70b-versatile",
+        default="openai/gpt-oss-120b",
         description="Groq-hosted model identifier.",
         json_schema_extra={"examples": GROQ_MODELS, "allow_custom_input": True},
     )
@@ -1660,6 +1669,37 @@ class LmntTTSConfiguration(BaseTTSConfiguration):
     )
 
 
+@register_tts
+class RumikTTSConfiguration(BaseTTSConfiguration):
+    model_config = RUMIK_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.RUMIK] = ServiceProviders.RUMIK
+    model: str = Field(
+        default="mulberry",
+        description="Rumik streaming model. 'mulberry' for ultra-low-latency voice description steering, 'muga' for expressive tone tags.",
+        json_schema_extra={"examples": list(RUMIK_TTS_MODELS)},
+    )
+    voice: str = Field(
+        default="warm professional female, Indian accent",
+        description="Rumik voice description prompt or voice name.",
+        json_schema_extra={
+            "examples": list(RUMIK_TTS_VOICE_PRESETS),
+            "allow_custom_input": True,
+        },
+    )
+    language: str = Field(
+        default="hi",
+        description="Language code for Rumik Silk synthesis (e.g. 'hi', 'en', 'hinglish', 'ta', 'te', 'bn', 'mr', 'gu', 'kn').",
+        json_schema_extra={
+            "examples": list(RUMIK_TTS_LANGUAGES),
+            "allow_custom_input": True,
+        },
+    )
+    base_url: str = Field(
+        default="https://silk-api.rumik.ai",
+        description="Rumik Silk gateway endpoint.",
+    )
+
+
 # Only the streaming-native Simba models: pipecat's SpeechifyHttpTTSService
 # uses the /v1/audio/stream/with-timestamps endpoint, which rejects the legacy
 # simba-english/simba-multilingual models.
@@ -1743,6 +1783,7 @@ TTSConfig = Annotated[
         SmallestAITTSConfiguration,
         XAITTSConfiguration,
         LmntTTSConfiguration,
+        RumikTTSConfiguration,
         SpeechifyTTSConfiguration,
     ],
     Field(discriminator="provider"),

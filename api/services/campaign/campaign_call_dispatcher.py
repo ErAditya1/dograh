@@ -20,6 +20,7 @@ from api.services.campaign.errors import (
     CampaignRateLimitTimeout,
     ConcurrentSlotAcquisitionError,
 )
+from api.services.campaign.traffic_split import campaign_split, pick_variant
 from api.services.quota_service import authorize_workflow_run_start
 from api.services.workflow.initial_context import merge_external_initial_context
 from api.services.workflow.run_creation import prepare_workflow_run_inputs
@@ -54,6 +55,20 @@ class CampaignCallDispatcher:
             campaign.organization_id,
             db=db_client,
         )
+        config_numbers = await db_client.list_phone_numbers_for_config(resolved_id)
+        cfg = await db_client.get_telephony_configuration_for_org(
+            resolved_id, campaign.organization_id, active_only=False
+        )
+        if (
+            (cfg and bool(cfg.name) and cfg.name.startswith("Platform - "))
+            or getattr(cfg, "is_platform_inventory", False)
+            or (bool(config_numbers) and any(getattr(n, "pool_type", None) == "shared_trial" for n in config_numbers))
+        ):
+            total_rows = campaign.total_rows or 0
+            if total_rows > 10:
+                raise ValueError(
+                    f"Campaign {campaign.id} exceeds test limit (maximum 10 contacts allowed for shared trial number)."
+                )
         if requested_id is None:
             logger.warning(
                 f"Campaign {campaign.id} has no telephony_configuration_id; "
@@ -203,15 +218,18 @@ class CampaignCallDispatcher:
         attempted = False
         accepted = False
         try:
-            workflow = await db_client.get_workflow(
-                campaign.workflow_id,
-                organization_id=campaign.organization_id,
-            )
-            if not workflow:
-                raise ValueError(f"Workflow {campaign.workflow_id} not found")
             phone_number = queued_run.context_variables.get("phone_number")
             if not phone_number:
                 raise ValueError(f"No phone number in queued run {queued_run.id}")
+            split = campaign_split(campaign)
+            variant = pick_variant(split, phone_number)
+            workflow_id = variant["workflow_id"]
+            workflow = await db_client.get_workflow(
+                workflow_id,
+                organization_id=campaign.organization_id,
+            )
+            if not workflow:
+                raise ValueError(f"Workflow {workflow_id} not found")
 
             provider = await self.get_provider_for_campaign(campaign)
             from_number = await rate_limiter.select_from_number(
@@ -227,12 +245,23 @@ class CampaignCallDispatcher:
                 "caller_number": from_number,
                 "called_number": phone_number,
                 "direction": "outbound",
+                "provider": provider.PROVIDER_NAME,
+                "organization_id": campaign.organization_id,
                 "telephony_configuration_id": campaign.telephony_configuration_id,
             }
-            run_inputs = await prepare_workflow_run_inputs(db_client, workflow)
+            if campaign.orchestrator_metadata:
+                if campaign.orchestrator_metadata.get("voice"):
+                    initial_context["voice"] = campaign.orchestrator_metadata["voice"]
+                if campaign.orchestrator_metadata.get("voice_id"):
+                    initial_context["voice_id"] = campaign.orchestrator_metadata["voice_id"]
+                if campaign.orchestrator_metadata.get("tts_provider"):
+                    initial_context["tts_provider"] = campaign.orchestrator_metadata["tts_provider"]
+            run_inputs = await prepare_workflow_run_inputs(
+                db_client, workflow, definition_id=variant["workflow_definition_id"]
+            )
             workflow_run = await db_client.create_workflow_run(
                 name=f"WR-CAMPAIGN-{campaign.id}-{queued_run.id}",
-                workflow_id=campaign.workflow_id,
+                workflow_id=workflow_id,
                 mode=provider.PROVIDER_NAME,
                 user_id=campaign.created_by,
                 initial_context=initial_context,
@@ -240,6 +269,12 @@ class CampaignCallDispatcher:
                 queued_run_id=queued_run.id,
                 organization_id=campaign.organization_id,
                 definition_id=run_inputs.definition_id,
+                campaign_traffic_split={
+                    "variant_id": variant["id"],
+                    "revision": split["revision"],
+                    "workflow_definition_id": variant["workflow_definition_id"],
+                    "weight": variant["weight"],
+                },
             )
             await call_concurrency.bind_workflow_run(concurrency_slot, workflow_run.id)
             if queued_run.context_variables.get("is_retry"):
@@ -249,7 +284,7 @@ class CampaignCallDispatcher:
                     gathered_context={"call_tags": ["retry", f"retry_reason_{reason}"]},
                 )
             quota = await authorize_workflow_run_start(
-                workflow_id=campaign.workflow_id,
+                workflow_id=workflow_id,
                 organization_id=campaign.organization_id,
                 workflow_run_id=workflow_run.id,
             )
@@ -259,7 +294,7 @@ class CampaignCallDispatcher:
             backend_endpoint, _ = await get_backend_endpoints()
             webhook_url = (
                 f"{backend_endpoint}/api/v1/telephony/{provider.WEBHOOK_ENDPOINT}"
-                f"?workflow_id={campaign.workflow_id}"
+                f"?workflow_id={workflow_id}"
                 f"&workflow_run_id={workflow_run.id}"
                 f"&organization_id={campaign.organization_id}"
             )
@@ -275,7 +310,7 @@ class CampaignCallDispatcher:
                 webhook_url=webhook_url,
                 workflow_run_id=workflow_run.id,
                 from_number=from_number,
-                workflow_id=campaign.workflow_id,
+                workflow_id=workflow_id,
                 organization_id=campaign.organization_id,
             )
             accepted = True

@@ -105,7 +105,7 @@ foreach ($spec in $serviceSpecs) {
 ###############################################################################
 
 if (-not $NoMigrations) {
-    alembic -c (Join-Path $BaseDir 'api/alembic.ini') upgrade head
+    python -m alembic -c (Join-Path $BaseDir 'api/alembic.ini') upgrade head
 }
 
 ###############################################################################
@@ -143,7 +143,7 @@ Write-Host "Waiting for uvicorn health check at $healthUrl ..."
 $healthy = $false
 for ($attempt = 1; $attempt -le $HealthMaxAttempts; $attempt++) {
     try {
-        $resp = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+        $resp = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
         if ($resp.StatusCode -eq 200) {
             Write-Host "OK uvicorn healthy (attempt $attempt)"
             $healthy = $true

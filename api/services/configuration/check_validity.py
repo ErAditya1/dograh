@@ -70,6 +70,7 @@ class UserConfigurationValidator:
             ServiceProviders.XAI.value: self._check_xai_api_key,
             ServiceProviders.LMNT.value: self._check_lmnt_api_key,
             ServiceProviders.SPEECHIFY.value: self._check_speechify_api_key,
+            ServiceProviders.RUMIK.value: self._check_rumik_api_key,
         }
 
     async def validate(
@@ -209,6 +210,18 @@ class UserConfigurationValidator:
                 ]
 
         api_key = service_config.api_key
+        has_key = bool(api_key.strip()) if isinstance(api_key, str) else bool(api_key)
+        if not has_key:
+            from api.services.platform_keys import get_platform_master_key
+            master_key = get_platform_master_key(service_name, provider)
+            if master_key:
+                return []
+            return [
+                {
+                    "model": service_name,
+                    "message": f"API key is missing for {provider}, and no active platform master key is configured.",
+                }
+            ]
 
         try:
             if not self._check_api_key(provider, api_key, service_config):
@@ -512,4 +525,9 @@ class UserConfigurationValidator:
         return True
 
     def _check_smallest_api_key(self, model: str, api_key: str) -> bool:
+        return True
+
+    def _check_rumik_api_key(self, model: str, api_key: str) -> bool:
+        if not api_key:
+            raise ValueError("API key is required for Rumik AI Silk TTS")
         return True

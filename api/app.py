@@ -40,6 +40,7 @@ from api.services.pipecat.tracing_config import (
     handle_langfuse_sync,
     load_all_org_langfuse_credentials,
 )
+from api.services.pipecat.tts_cache.runtime import close_speech_cache
 from api.services.worker_sync.manager import (
     WorkerSyncManager,
     set_worker_sync_manager,
@@ -62,6 +63,18 @@ async def lifespan(app: FastAPI):
         # before any pipeline runs, without per-call DB lookups.
         await load_all_org_langfuse_credentials()
 
+        # Load platform master keys cache from DB for zero-latency runtime fallback
+        from api.services.platform_keys import refresh_master_keys_cache
+        await refresh_master_keys_cache()
+
+        # Load platform global settings (e.g. USD to INR rate, GST) from DB
+        from api.services.platform_settings import refresh_platform_settings_cache
+        await refresh_platform_settings_cache()
+
+        # Ensure SaaS plans table and seed standard tiers (Pay-as-you-go, Starter, Pro, Enterprise)
+        from api.services.plan_service import plan_service
+        await plan_service.ensure_default_plans()
+
         # Start cross-worker sync manager so config changes propagate to all workers
         sync_manager = WorkerSyncManager(REDIS_URL)
         sync_manager.register(
@@ -71,6 +84,11 @@ async def lifespan(app: FastAPI):
         set_worker_sync_manager(sync_manager)
 
         from api.services.observability import loop_exceptions, loop_lag, metrics
+        from api.services.observability.call_events import (
+            delivery as call_event_delivery,
+        )
+
+        call_event_delivery.start()
 
         # Event-loop lag gauge — per-pod saturation signal read off
         # /health/active-calls during autoscaling load tests.
@@ -84,11 +102,15 @@ async def lifespan(app: FastAPI):
             yield  # Run app
         finally:
             logger.info("Starting graceful shutdown...")
+            await call_event_delivery.shutdown()
             try:
                 await sync_manager.stop()
             finally:
-                await loop_lag.stop()
-                metrics.stop()
+                try:
+                    await close_speech_cache()
+                finally:
+                    await loop_lag.stop()
+                    metrics.stop()
 
 
 app = FastAPI(
@@ -122,21 +144,17 @@ async def handle_mps_unavailable_error(
 # (same-origin, so CORS does not apply). Keep it permissive without
 # credentials — wildcard + credentials is rejected by browsers and unsafe.
 # SaaS deployments must set CORS_ALLOWED_ORIGINS to an explicit allowlist.
-if DEPLOYMENT_MODE == "oss":
+if CORS_ALLOWED_ORIGINS:
+    cors_origins = CORS_ALLOWED_ORIGINS
+    cors_allow_credentials = True
+elif DEPLOYMENT_MODE == "oss":
     cors_origins: list[str] = ["*"]
     cors_allow_credentials = False
 else:
-    if not CORS_ALLOWED_ORIGINS:
-        raise RuntimeError(
-            "CORS_ALLOWED_ORIGINS must be set to an explicit origin allowlist "
-            "when DEPLOYMENT_MODE != 'oss'"
-        )
-    if "*" in CORS_ALLOWED_ORIGINS:
-        raise RuntimeError(
-            "CORS_ALLOWED_ORIGINS cannot contain '*' with credentialed requests"
-        )
-    cors_origins = CORS_ALLOWED_ORIGINS
-    cors_allow_credentials = True
+    raise RuntimeError(
+        "CORS_ALLOWED_ORIGINS must be set to an explicit origin allowlist "
+        "when DEPLOYMENT_MODE != 'oss'"
+    )
 
 app.add_middleware(
     CORSMiddleware,

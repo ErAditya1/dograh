@@ -31,7 +31,11 @@ from api.schemas.ai_model_configuration import (
     OrganizationAIModelConfigurationResponse,
     OrganizationAIModelConfigurationV2,
 )
-from api.schemas.organization_preferences import OrganizationPreferences
+from api.schemas.call_events import CallEventsConnectionResult, CallEventsSettings
+from api.schemas.organization_preferences import (
+    OrganizationPreferences,
+    OrganizationPreferencesResponse,
+)
 from api.schemas.telephony_config import (
     TelephonyConfigRequest,
     TelephonyConfigurationCreateRequest,
@@ -78,15 +82,20 @@ from api.services.configuration.registry import (
     ServiceType,
 )
 from api.services.mps_billing import ensure_hosted_mps_billing_account_v2
+from api.services.telephony.shared_trial_sync import sync_shared_trial_telephony_for_org
 from api.services.mps_service_key_client import mps_service_key_client
+from api.services.observability.call_events.configuration import (
+    check_connection,
+    resolve_settings,
+)
 from api.services.organization_context import (
     OrganizationContextResponse,
     get_organization_context,
 )
 from api.services.organization_preferences import (
     external_pbx_integrations_enabled,
-    get_organization_preferences,
-    upsert_organization_preferences,
+    get_organization_preferences_response,
+    update_organization_preferences,
 )
 from api.services.pipecat.tracing_config import normalize_langfuse_host
 from api.services.posthog_client import capture_event
@@ -248,6 +257,9 @@ async def get_telephony_providers_metadata(user: UserModel = Depends(get_user)):
     for spec in telephony_registry.all_specs():
         if spec.ui_metadata is None:
             continue
+        # Hide Cloudonix as it relies on Dograh MPS central service
+        if spec.name == "cloudonix":
+            continue
         providers.append(
             TelephonyProviderMetadata(
                 provider=spec.name,
@@ -366,6 +378,32 @@ async def get_model_configuration_v2_defaults(
         for service, provider in DEFAULT_SERVICE_PROVIDERS.items()
         if provider != ServiceProviders.DOGRAH.value
     }
+    # Gather active master keys safely (no secret api keys)
+    master_keys_summary: dict[str, dict[str, Any]] = {
+        "llm": {},
+        "stt": {},
+        "tts": {},
+    }
+    try:
+        from api.services.platform_keys import _MASTER_KEYS_CACHE
+        for s_type, prov_map in _MASTER_KEYS_CACHE.items():
+            st_lower = s_type.lower()
+            if st_lower not in master_keys_summary:
+                master_keys_summary[st_lower] = {}
+            for prov, data in prov_map.items():
+                is_def = bool(data.get("is_default"))
+                def_m = data.get("default_model")
+                master_keys_summary[st_lower][prov.lower()] = {
+                    "is_default": is_def,
+                    "default_model": def_m,
+                    "models_pricing": data.get("models_pricing") or {},
+                }
+                # If platform has a default master key for this service, update byok_default_providers
+                if is_def:
+                    byok_default_providers[st_lower] = prov.lower()
+    except Exception as e:
+        logger.warning("Could not load master keys cache for defaults: {}", e)
+
     return {
         "dograh": {
             "voices": [DOGRAH_DEFAULT_VOICE],
@@ -399,6 +437,7 @@ async def get_model_configuration_v2_defaults(
                 "default_providers": byok_default_providers,
             },
         },
+        "platform_master_keys": master_keys_summary,
     }
 
 
@@ -606,23 +645,59 @@ async def get_disposition_codes(
     )
 
 
-@router.get("/preferences", response_model=OrganizationPreferences)
+@router.get("/preferences", response_model=OrganizationPreferencesResponse)
 async def get_preferences(
     user: UserModel = Depends(get_user_with_selected_organization),
 ):
     organization_id = user.selected_organization_id
-    return await get_organization_preferences(organization_id)
+    return await get_organization_preferences_response(organization_id)
 
 
-@router.put("/preferences", response_model=OrganizationPreferences)
+@router.put("/preferences", response_model=OrganizationPreferencesResponse)
 async def save_preferences(
     request: OrganizationPreferences,
     user: UserModel = Depends(get_user_with_selected_organization),
 ):
-    organization_id = user.selected_organization_id
-    return await upsert_organization_preferences(
-        organization_id,
-        request,
+    try:
+        return await update_organization_preferences(
+            user.selected_organization_id, request
+        )
+    except ValueError as exc:
+        raise _preferences_validation_error(exc) from None
+
+
+def _preferences_validation_error(exc: ValueError) -> HTTPException:
+    # Destination validation inputs can contain private keys. Never echo them.
+    if isinstance(exc, ValidationError):
+        messages = [
+            f"{'.'.join(map(str, e['loc']))}: {e['msg']}"
+            for e in exc.errors(include_input=False)
+        ]
+        return HTTPException(422, "; ".join(messages))
+    return HTTPException(422, str(exc))
+
+
+@router.post("/call-events/test", response_model=CallEventsConnectionResult)
+async def test_call_events_connection(
+    request: CallEventsSettings,
+    user: UserModel = Depends(get_user_with_selected_organization),
+):
+    try:
+        settings = await resolve_settings(user.selected_organization_id, request)
+    except ValueError as exc:
+        raise _preferences_validation_error(exc) from None
+    if not settings.sink_type:
+        raise HTTPException(422, "Select a destination")
+    try:
+        await check_connection(settings)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except Exception:
+        raise HTTPException(
+            400, "Connection failed. Check the destination and credentials."
+        ) from None
+    return CallEventsConnectionResult(
+        message="Connection and table schema verified. No events were written; write permission is checked on export."
     )
 
 
@@ -828,9 +903,22 @@ async def list_telephony_configurations(user: UserModel = Depends(get_user)):
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
+    try:
+        await sync_shared_trial_telephony_for_org(user.selected_organization_id)
+    except Exception as e:
+        logger.warning(
+            f"Failed to sync shared trial telephony for org {user.selected_organization_id}: {e}"
+        )
+
     rows = await db_client.list_telephony_configurations(user.selected_organization_id)
     items: List[TelephonyConfigurationListItem] = []
     for row in rows:
+        # Hide Cloudonix configs that rely on Dograh MPS
+        if row.provider == "cloudonix" and (
+            row.name in ("Dograh Cloudonix SIP", "Cloudonix")
+            or (row.credentials or {}).get("managed_by") == "dograh"
+        ):
+            continue
         numbers = await db_client.list_phone_numbers_for_config(row.id)
         active = [n for n in numbers if n.is_active]
         trunks = await _list_trunks_if_supported(row.provider, row.id)
@@ -845,6 +933,11 @@ async def list_telephony_configurations(user: UserModel = Depends(get_user)):
             unassigned_active_phone_number_count=len(
                 [n for n in active if n.telephony_trunk_id is None]
             ),
+        )
+        is_shared = (
+            (bool(row.name) and row.name.startswith("Platform - "))
+            or (len(active) > 0 and any(getattr(n, "pool_type", None) == "shared_trial" for n in active))
+            or getattr(row, "is_platform_inventory", False)
         )
         items.append(
             TelephonyConfigurationListItem(
@@ -863,6 +956,7 @@ async def list_telephony_configurations(user: UserModel = Depends(get_user)):
                 outbound_blocked_reason=(
                     checklist.outbound_blocked_reason if checklist else None
                 ),
+                is_shared_trial=is_shared,
                 created_at=row.created_at,
                 updated_at=row.updated_at,
             )
@@ -1831,3 +1925,358 @@ async def get_campaign_defaults(user: UserModel = Depends(get_user)):
         default_retry_config=RetryConfigResponse(**DEFAULT_CAMPAIGN_RETRY_CONFIG),
         last_campaign_settings=last_campaign_settings,
     )
+
+
+# =========================================================================
+# Customer Plan & Subscription Endpoints
+# =========================================================================
+
+class CustomerUpgradePlanRequest(BaseModel):
+    plan_slug: str
+    payment_method: str = "wallet"  # "wallet" | "razorpay"
+
+
+class CustomerVerifyPlanUpgradeRequest(BaseModel):
+    plan_slug: str
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+
+@router.get("/subscription")
+async def get_my_organization_subscription(
+    category: Optional[str] = Query(None, description="Optional plan category: 'simple' or 'developer'"),
+    user: UserModel = Depends(get_user_with_selected_organization),
+):
+    """Get the current organization's subscription status, limits, and public plans for upgrade."""
+    from api.services.plan_service import plan_service, normalize_plan_features
+
+    org_id = user.selected_organization_id
+
+    # Auto-reconcile any paid plan transactions that were verified on payment gateway
+    try:
+        from api.db.models import PaymentTransactionModel
+        from sqlalchemy import select, desc
+        import json
+
+        async with db_client.async_session() as session:
+            stmt = (
+                select(PaymentTransactionModel)
+                .where(
+                    PaymentTransactionModel.organization_id == org_id,
+                    PaymentTransactionModel.status == "paid",
+                )
+                .order_by(desc(PaymentTransactionModel.id))
+                .limit(5)
+            )
+            res = await session.execute(stmt)
+            paid_txs = res.scalars().all()
+            for tx in paid_txs:
+                notes = tx.notes if isinstance(tx.notes, dict) else (json.loads(tx.notes) if tx.notes else {})
+                if notes.get("purpose") == "plan_subscription_purchase" and notes.get("plan_slug"):
+                    target_slug = notes["plan_slug"]
+                    current_org = await db_client.get_organization_by_id(org_id)
+                    if current_org and current_org.subscription_tier != target_slug:
+                        logger.info(
+                            "Auto-reconciling paid plan upgrade '{}' for org {} from tx {}",
+                            target_slug,
+                            org_id,
+                            tx.id,
+                        )
+                        await plan_service.assign_organization_plan(
+                            organization_id=org_id,
+                            plan_slug=target_slug,
+                            reset_minutes_used=True,
+                        )
+                        break
+    except Exception as exc:
+        logger.warning("Auto-reconciliation check error: {}", exc)
+
+    limits = await plan_service.get_effective_limits(org_id)
+    org = await db_client.get_organization_by_id(org_id)
+    workflow_count = await db_client.get_workflow_count(org_id)
+    public_plans = await plan_service.list_plans(include_inactive=False, category=category)
+
+    return {
+        "current_subscription": {
+            "tier": limits.tier,
+            "tier_name": limits.tier_name,
+            "subscription_status": limits.subscription_status,
+            "max_concurrent_calls": limits.max_concurrent_calls,
+            "max_agents": limits.max_agents,
+            "current_agents_count": workflow_count,
+            "included_minutes": limits.included_minutes,
+            "monthly_minutes_used": round(limits.monthly_minutes_used, 2),
+            "minutes_remaining": round(limits.minutes_remaining, 2),
+            "is_unlimited_minutes": limits.is_unlimited_minutes,
+            "overage_rate_per_minute_usd": limits.overage_rate_per_minute_usd,
+            "allow_byok": limits.allow_byok,
+            "wallet_balance_usd": round(limits.wallet_balance_usd, 4),
+            "plan_credits_monthly_usd": round(limits.plan_credits_monthly_usd, 2),
+            "plan_credits_remaining_usd": round(limits.plan_credits_remaining_usd, 2),
+            "included_phone_numbers": limits.included_phone_numbers,
+            "byok_platform_fee_per_minute_usd": limits.byok_platform_fee_per_minute_usd,
+            "allow_live_transfer": limits.allow_live_transfer,
+            "allow_sip_trunking": limits.allow_sip_trunking,
+            "custom_monthly_price_usd": limits.custom_monthly_price_usd,
+            "billing_cycle_start": org.billing_cycle_start.isoformat() if org and org.billing_cycle_start else None,
+            "billing_cycle_end": org.billing_cycle_end.isoformat() if org and org.billing_cycle_end else None,
+        },
+        "available_plans": [
+            {
+                "id": p.id,
+                "slug": p.slug,
+                "name": p.name,
+                "description": p.description,
+                "price_usd": p.price_usd,
+                "price_inr": p.price_inr,
+                "billing_interval": p.billing_interval,
+                "included_minutes": p.included_minutes,
+                "monthly_credits_usd": getattr(p, "monthly_credits_usd", 0.0),
+                "included_phone_numbers": getattr(p, "included_phone_numbers", 0),
+                "max_concurrent_calls": p.max_concurrent_calls,
+                "max_agents": p.max_agents,
+                "overage_rate_per_minute_usd": p.overage_rate_per_minute_usd,
+                "byok_platform_fee_per_minute_usd": getattr(p, "byok_platform_fee_per_minute_usd", 0.04),
+                "allow_byok": p.allow_byok,
+                "allow_live_transfer": getattr(p, "allow_live_transfer", False),
+                "allow_sip_trunking": getattr(p, "allow_sip_trunking", False),
+                "features": normalize_plan_features(p.features),
+            }
+            for p in public_plans
+            if p.is_public
+        ],
+    }
+
+
+@router.post("/subscription/upgrade")
+async def upgrade_my_organization_plan(
+    request: CustomerUpgradePlanRequest,
+    user: UserModel = Depends(get_user_with_selected_organization),
+):
+    """Customer self-service upgrade or switch plan with payment verification."""
+    from datetime import datetime, UTC
+    from api.services.plan_service import plan_service
+    from api.constants import RAZORPAY_KEY_ID
+    from api.services.platform_settings import get_gst_percentage, get_usd_to_inr_rate
+    from api.db.payment_client import payment_client
+    from api.services.razorpay_client import razorpay_service
+
+    org_id = user.selected_organization_id
+    plan = await plan_service.get_plan_by_slug(request.plan_slug)
+    if not plan or not plan.is_active:
+        raise HTTPException(status_code=400, detail="Requested plan is not available")
+
+    # If enterprise is selected, prompt to contact sales
+    if plan.slug == "enterprise":
+        return {
+            "status": "contact_sales",
+            "message": "Enterprise plans are customized per organization. Our team will contact you to configure your custom concurrency and SLA.",
+        }
+
+    # Free plan switch (Pay-As-You-Go or $0 price)
+    if plan.price_usd == 0.0 or plan.slug == "pay_as_you_go":
+        updated_limits = await plan_service.assign_organization_plan(
+            organization_id=org_id,
+            plan_slug=request.plan_slug,
+            reset_minutes_used=True,
+        )
+        return {
+            "status": "success",
+            "message": f"Successfully switched to {updated_limits.tier_name} plan!",
+            "new_limits": {
+                "tier": updated_limits.tier,
+                "tier_name": updated_limits.tier_name,
+                "max_concurrent_calls": updated_limits.max_concurrent_calls,
+                "max_agents": updated_limits.max_agents,
+                "included_minutes": updated_limits.included_minutes,
+                "minutes_remaining": updated_limits.minutes_remaining,
+            },
+        }
+
+    # Paid Plan Upgrade ($49+, $149+, etc.)
+    org = await db_client.get_organization_by_id(org_id)
+    wallet_balance = float(getattr(org, "wallet_balance_usd", 0.0) or 0.0)
+
+    if request.payment_method == "wallet":
+        if wallet_balance < plan.price_usd:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient wallet balance (${wallet_balance:.2f} USD). Upgrading to {plan.name} requires ${plan.price_usd:.2f} USD. Please recharge your wallet or choose Pay with Razorpay / UPI.",
+            )
+
+        # Deduct plan price from wallet
+        new_balance = await db_client.update_wallet_balance(org_id, -plan.price_usd)
+
+        # Record paid transaction in ledger
+        receipt_id = f"plan_{plan.slug[:10]}_{org_id}_{int(datetime.now(UTC).timestamp())}"
+        try:
+            await payment_client.create_transaction(
+                organization_id=org_id,
+                user_id=user.id,
+                amount_usd=plan.price_usd,
+                amount_inr=0.0,
+                currency="USD",
+                receipt=receipt_id,
+                razorpay_order_id="wallet_balance_payment",
+                notes={
+                    "purpose": "plan_subscription_purchase",
+                    "plan_slug": plan.slug,
+                    "paid_via": "wallet_balance",
+                    "status": "paid",
+                },
+            )
+        except Exception as exc:
+            logger.warning("Could not register plan payment transaction: {}", exc)
+
+        # Activate plan
+        updated_limits = await plan_service.assign_organization_plan(
+            organization_id=org_id,
+            plan_slug=request.plan_slug,
+            reset_minutes_used=True,
+        )
+
+        return {
+            "status": "success",
+            "message": f"Successfully activated {updated_limits.tier_name}! ${plan.price_usd:.2f} USD deducted from your wallet balance.",
+            "wallet_balance_after": new_balance,
+            "new_limits": {
+                "tier": updated_limits.tier,
+                "tier_name": updated_limits.tier_name,
+                "max_concurrent_calls": updated_limits.max_concurrent_calls,
+                "max_agents": updated_limits.max_agents,
+                "included_minutes": updated_limits.included_minutes,
+                "minutes_remaining": updated_limits.minutes_remaining,
+            },
+        }
+
+    elif request.payment_method == "razorpay":
+        # Create Razorpay Order for Subscription Purchase
+        usd_rate = get_usd_to_inr_rate()
+        gst = get_gst_percentage()
+        subtotal_inr = round(plan.price_usd * usd_rate, 2)
+        gst_amount_inr = round(subtotal_inr * (gst / 100.0), 2)
+        total_inr = round(subtotal_inr + gst_amount_inr, 2)
+        amount_paise = int(round(total_inr * 100))
+
+        receipt = razorpay_service.generate_receipt_id(org_id)
+        notes = {
+            "platform": "CallioAI",
+            "receipt": receipt,
+            "organization_id": str(org_id),
+            "user_id": str(user.id),
+            "user_email": str(user.email or ""),
+            "purpose": "plan_subscription_purchase",
+            "plan_slug": plan.slug,
+            "plan_name": plan.name,
+            "amount_usd": str(plan.price_usd),
+            "total_inr": str(total_inr),
+        }
+
+        order_data = await razorpay_service.create_order(
+            amount_paise=amount_paise,
+            currency="INR",
+            receipt=receipt,
+            notes=notes,
+        )
+        razorpay_order_id = order_data["id"]
+
+        try:
+            await payment_client.create_pending_transaction(
+                organization_id=org_id,
+                user_id=user.id,
+                amount_usd=plan.price_usd,
+                amount_inr=total_inr,
+                receipt=receipt,
+                razorpay_order_id=razorpay_order_id,
+                currency="INR",
+                notes=notes,
+            )
+        except Exception as exc:
+            logger.warning("Could not create pending transaction for plan upgrade: {}", exc)
+
+        return {
+            "status": "payment_required",
+            "order_id": razorpay_order_id,
+            "key_id": RAZORPAY_KEY_ID,
+            "amount": amount_paise,
+            "currency": "INR",
+            "plan_slug": plan.slug,
+            "plan_name": plan.name,
+            "amount_usd": plan.price_usd,
+            "total_inr": total_inr,
+            "receipt": receipt,
+        }
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid payment method. Must be 'wallet' or 'razorpay'.",
+        )
+
+
+@router.post("/subscription/upgrade/verify")
+async def verify_plan_upgrade_payment(
+    request: CustomerVerifyPlanUpgradeRequest,
+    user: UserModel = Depends(get_user_with_selected_organization),
+):
+    """Verify Razorpay payment for plan subscription and activate the plan."""
+    from sqlalchemy import update
+    from api.db.models import PaymentTransactionModel
+    from api.services.plan_service import plan_service
+    from api.db.payment_client import payment_client
+    from api.services.razorpay_client import razorpay_service
+
+    org_id = user.selected_organization_id
+    plan = await plan_service.get_plan_by_slug(request.plan_slug)
+    if not plan or not plan.is_active:
+        raise HTTPException(status_code=400, detail="Plan not found")
+
+    is_valid = razorpay_service.verify_payment_signature(
+        order_id=request.razorpay_order_id,
+        payment_id=request.razorpay_payment_id,
+        signature=request.razorpay_signature,
+    )
+
+    if not is_valid:
+        await payment_client.mark_transaction_failed(
+            request.razorpay_order_id, reason="Invalid signature"
+        )
+        raise HTTPException(status_code=400, detail="Invalid payment verification signature")
+
+    # Mark transaction as paid
+    try:
+        async with payment_client.async_session() as session:
+            stmt = (
+                update(PaymentTransactionModel)
+                .where(PaymentTransactionModel.razorpay_order_id == request.razorpay_order_id)
+                .values(
+                    status="paid",
+                    razorpay_payment_id=request.razorpay_payment_id,
+                    razorpay_signature=request.razorpay_signature,
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+    except Exception as exc:
+        logger.warning("Could not update plan transaction status: {}", exc)
+
+    # Activate plan for the organization!
+    updated_limits = await plan_service.assign_organization_plan(
+        organization_id=org_id,
+        plan_slug=request.plan_slug,
+        reset_minutes_used=True,
+    )
+
+    return {
+        "status": "success",
+        "message": f"Payment verified! Upgraded to {updated_limits.tier_name} plan!",
+        "new_limits": {
+            "tier": updated_limits.tier,
+            "tier_name": updated_limits.tier_name,
+            "max_concurrent_calls": updated_limits.max_concurrent_calls,
+            "max_agents": updated_limits.max_agents,
+            "included_minutes": updated_limits.included_minutes,
+            "minutes_remaining": updated_limits.minutes_remaining,
+        },
+    }

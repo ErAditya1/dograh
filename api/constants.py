@@ -1,13 +1,19 @@
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
 from api.enums import Environment
 
-ENVIRONMENT = os.getenv("ENVIRONMENT", Environment.LOCAL.value)
 # Absolute path to the project root directory (i.e. the directory containing
 # the top-level api/ package). Having a single canonical location helps
 # when constructing file-system paths elsewhere in the codebase.
 APP_ROOT_DIR: Path = Path(__file__).resolve().parent
+
+_env_file = APP_ROOT_DIR / ".env"
+if _env_file.exists():
+    load_dotenv(_env_file, override=True)
+
+ENVIRONMENT = os.getenv("ENVIRONMENT", Environment.LOCAL.value)
 
 FILLER_SOUND_PROBABILITY = 0.0
 
@@ -69,18 +75,51 @@ CORS_ALLOWED_ORIGINS = [
 ]
 AUTH_PROVIDER = os.getenv("AUTH_PROVIDER", "local")
 ENABLE_SIGNUP = os.getenv("ENABLE_SIGNUP", "true").lower() == "true"
-# Stack Auth public client config. These are safe to expose to the browser (the
-# publishable client key is public by design, and the project id is non-sensitive),
-# and are served to the UI at runtime via /api/v1/health so the frontend no longer
-# needs them baked into the bundle at build time.
-STACK_AUTH_PROJECT_ID = os.getenv("STACK_AUTH_PROJECT_ID")
-STACK_PUBLISHABLE_CLIENT_KEY = os.getenv("STACK_PUBLISHABLE_CLIENT_KEY")
+# Stack Auth / Hexclave configuration. Served to the UI at runtime via /api/v1/health
+# so the frontend does not need them hardcoded in Next.js environment files.
+STACK_AUTH_PROJECT_ID = (
+    os.getenv("STACK_AUTH_PROJECT_ID")
+    or os.getenv("NEXT_PUBLIC_HEXCLAVE_PROJECT_ID")
+    or os.getenv("HEXCLAVE_PROJECT_ID")
+)
+STACK_PUBLISHABLE_CLIENT_KEY = (
+    os.getenv("STACK_PUBLISHABLE_CLIENT_KEY")
+    or os.getenv("NEXT_PUBLIC_HEXCLAVE_PUBLISHABLE_CLIENT_KEY")
+    or os.getenv("HEXCLAVE_PUBLISHABLE_CLIENT_KEY")
+    or ""
+)
+STACK_AUTH_API_URL = (
+    os.getenv("STACK_AUTH_API_URL")
+    or os.getenv("NEXT_PUBLIC_HEXCLAVE_API_URL")
+    or os.getenv("HEXCLAVE_API_URL")
+    or "https://api.stack-auth.com"
+)
+STACK_SECRET_SERVER_KEY = (
+    os.getenv("STACK_SECRET_SERVER_KEY")
+    or os.getenv("HEXCLAVE_SECRET_SERVER_KEY")
+)
 DOGRAH_MPS_SECRET_KEY = os.getenv("DOGRAH_MPS_SECRET_KEY", None)
 MPS_API_URL = os.getenv("MPS_API_URL", "https://services.dograh.com")
 DOGRAH_DEVOPS_SECRET = os.getenv("DOGRAH_DEVOPS_SECRET") or None
 ENABLE_PROMETHEUS_METRICS = (
     os.getenv("ENABLE_PROMETHEUS_METRICS", "false").lower() == "true"
 )
+
+# Razorpay Configuration
+RAZORPAY_KEY_ID = (
+    os.getenv("RAZOR_PAY_API_KEY_ID")
+    or os.getenv("RAZORPAY_KEY_ID")
+    or "rzp_test_2oYqLjGL99Pujg"
+)
+RAZORPAY_KEY_SECRET = (
+    os.getenv("RAZOR_PAY_API_KEY_SECRET")
+    or os.getenv("RAZORPAY_KEY_SECRET")
+    or "gdD5vGQPYbNz8LjJ23ulC2kx"
+)
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET") or "aditya"
+USD_TO_INR_RATE = float(os.getenv("USD_TO_INR_RATE", "86.0"))
+GST_PERCENTAGE = float(os.getenv("GST_PERCENTAGE", "18.0"))
+
 
 # Storage Configuration
 ENABLE_AWS_S3 = os.getenv("ENABLE_AWS_S3", "false").lower() == "true"
@@ -274,4 +313,10 @@ FORCE_TURN_RELAY = os.getenv("FORCE_TURN_RELAY", "false").lower() == "true"
 OSS_JWT_SECRET = os.getenv("OSS_JWT_SECRET", "change-me-in-production")
 OSS_JWT_EXPIRY_HOURS = int(os.getenv("OSS_JWT_EXPIRY_HOURS", "720"))  # 30 days
 
+# Google OAuth Configuration
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:3000/api/auth/google/callback")
+
 TUNER_BASE_URL = os.getenv("TUNER_BASE_URL", "https://api.usetuner.ai")
+

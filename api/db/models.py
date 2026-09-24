@@ -150,6 +150,52 @@ class OrganizationModel(Base):
     )
 
     price_per_second_usd = Column(Float, nullable=True)
+    wallet_balance_usd = Column(
+        Float,
+        nullable=False,
+        default=0.0,
+        server_default=text("0.0"),
+        comment="Organization wallet balance in USD for platform credits",
+    )
+
+    # Subscription / Plan and Enterprise Overrides
+    subscription_tier = Column(
+        String(64),
+        nullable=False,
+        default="simple_trial",
+        server_default=text("'simple_trial'"),
+    )
+    subscription_status = Column(
+        String(32),
+        nullable=False,
+        default="active",
+        server_default=text("'active'"),
+    )
+    billing_cycle_start = Column(DateTime(timezone=True), nullable=True)
+    billing_cycle_end = Column(DateTime(timezone=True), nullable=True)
+    monthly_minutes_used = Column(
+        Float,
+        nullable=False,
+        default=0.0,
+        server_default=text("0.0"),
+    )
+    custom_concurrent_limit = Column(Integer, nullable=True)
+    custom_monthly_minutes = Column(Integer, nullable=True)
+    custom_max_agents = Column(Integer, nullable=True)
+    custom_allow_byok = Column(Boolean, nullable=True)
+    plan_credits_remaining_usd = Column(
+        Float, nullable=False, default=0.0, server_default=text("0.0")
+    )
+    plan_credits_monthly_usd = Column(
+        Float, nullable=False, default=0.0, server_default=text("0.0")
+    )
+    plan_credits_reset_at = Column(DateTime(timezone=True), nullable=True)
+    custom_monthly_price_usd = Column(Float, nullable=True)
+    custom_monthly_credits_usd = Column(Float, nullable=True)
+    custom_included_phone_numbers = Column(Integer, nullable=True)
+    custom_byok_platform_fee_usd = Column(Float, nullable=True)
+    custom_allow_live_transfer = Column(Boolean, nullable=True)
+    custom_allow_sip_trunking = Column(Boolean, nullable=True)
 
     # Relationships
     users = relationship(
@@ -229,6 +275,9 @@ class TelephonyConfigurationModel(Base):
     provider = Column(String(32), nullable=False)
     credentials = Column(JSON, nullable=False, default=dict)
     is_default_outbound = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    is_platform_inventory = Column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
     # Set by a connection worker when a config keeps failing (today only the ARI
@@ -374,6 +423,29 @@ class TelephonyPhoneNumberModel(Base):
     is_default_caller_id = Column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    is_platform_inventory = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    pool_type = Column(
+        String(32),
+        nullable=False,
+        default="dedicated",
+        server_default=text("'dedicated'"),
+    )
+    monthly_price_cents = Column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    assigned_organization_id = Column(
+        Integer, ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True
+    )
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    next_rental_billing_at = Column(DateTime(timezone=True), nullable=True)
+    rental_status = Column(
+        String(32),
+        nullable=False,
+        default="active",
+        server_default=text("'active'"),
+    )
     extra_metadata = Column(
         JSON, nullable=False, default=dict, server_default=text("'{}'::json")
     )
@@ -389,6 +461,9 @@ class TelephonyPhoneNumberModel(Base):
     )
     trunk = relationship("TelephonyTrunkModel", back_populates="phone_numbers")
     inbound_workflow = relationship("WorkflowModel")
+    assigned_organization = relationship(
+        "OrganizationModel", foreign_keys=[assigned_organization_id]
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -543,6 +618,17 @@ class WorkflowModel(Base):
     workflow_configurations = Column(
         JSON, nullable=False, default=dict, server_default=text("'{}'::json")
     )
+    price_per_second = Column(Float, nullable=True)
+    # Built-in Platform Template Fields
+    is_builtin = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    builtin_category = Column(String(64), nullable=True, default="Sales")
+    builtin_badge = Column(String(64), nullable=True, default="Featured")
+    builtin_description = Column(Text, nullable=True, default="")
+    builtin_variables = Column(JSON, nullable=False, default=list, server_default=text("'[]'::json"))
+    builtin_conversion_goal = Column(JSON, nullable=False, default=dict, server_default=text("'{}'::json"))
+    tested_by_admin = Column(Boolean, default=False, server_default=text("false"), nullable=False)
+    tested_at = Column(DateTime(timezone=True), nullable=True)
+
     runs = relationship("WorkflowRunModel", back_populates="workflow")
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
@@ -1537,3 +1623,112 @@ class KnowledgeBaseChunkModel(Base):
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
     )
+
+
+class PlatformMasterKeyModel(Base):
+    __tablename__ = "platform_master_keys"
+
+    id = Column(Integer, primary_key=True, index=True)
+    service_type = Column(String(16), nullable=False)  # 'llm', 'stt', 'tts'
+    provider = Column(String(32), nullable=False)      # 'openai', 'groq', 'deepgram', 'cartesia', 'elevenlabs', etc.
+    api_key = Column(String(512), nullable=False)
+    key_prefix = Column(String(32), nullable=False)    # e.g. 'sk-proj...3a12'
+    is_default = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    default_model = Column(String(128), nullable=True)  # e.g. 'llama-3.3-70b-versatile'
+    default_voice = Column(String(128), nullable=True)  # e.g. 'f786b574-daa5-4673-aa0c-cbe3e8534c02'
+    is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    models_pricing = Column(JSON, nullable=False, default=dict, server_default=text("'{}'::json"))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    __table_args__ = (
+        Index("ix_platform_master_keys_type_provider", "service_type", "provider"),
+        Index("ix_platform_master_keys_default", "service_type", "is_default"),
+    )
+
+
+class PaymentTransactionModel(Base):
+    __tablename__ = "payment_transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    amount_usd = Column(Float, nullable=False)
+    amount_inr = Column(Float, nullable=False)
+    currency = Column(String(8), nullable=False, default="INR", server_default=text("'INR'"))
+    receipt = Column(String(64), nullable=False, unique=True, index=True)
+    razorpay_order_id = Column(String(64), nullable=False, index=True)
+    razorpay_payment_id = Column(String(64), nullable=True, index=True)
+    razorpay_signature = Column(String(256), nullable=True)
+    status = Column(String(32), nullable=False, default="created", server_default=text("'created'"))
+    notes = Column(JSON, nullable=True, default=dict, server_default=text("'{}'::json"))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    __table_args__ = (
+        Index("ix_payment_transactions_org_status", "organization_id", "status"),
+    )
+
+
+class PlatformSettingModel(Base):
+    __tablename__ = "platform_settings"
+
+    key = Column(String(64), primary_key=True, index=True)
+    value = Column(String(256), nullable=False)
+    description = Column(String(256), nullable=True)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
+class SubscriptionPlanModel(Base):
+    __tablename__ = "subscription_plans"
+
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String(64), unique=True, nullable=False, index=True)
+    name = Column(String(128), nullable=False)
+    description = Column(Text, nullable=True)
+    price_usd = Column(Float, nullable=False, default=0.0, server_default=text("0.0"))
+    price_inr = Column(Float, nullable=False, default=0.0, server_default=text("0.0"))
+    billing_interval = Column(String(32), nullable=False, default="month", server_default=text("'month'"))
+    included_minutes = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    max_concurrent_calls = Column(Integer, nullable=False, default=2, server_default=text("2"))
+    max_agents = Column(Integer, nullable=False, default=1, server_default=text("1"))
+    overage_rate_per_minute_usd = Column(Float, nullable=False, default=0.10, server_default=text("0.10"))
+    monthly_credits_usd = Column(Float, nullable=False, default=0.0, server_default=text("0.0"))
+    byok_platform_fee_per_minute_usd = Column(Float, nullable=False, default=0.04, server_default=text("0.04"))
+    included_phone_numbers = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    allow_byok = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    allow_live_transfer = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    allow_sip_trunking = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    is_public = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    features = Column(JSON, nullable=False, default=list, server_default=text("'[]'::json"))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+

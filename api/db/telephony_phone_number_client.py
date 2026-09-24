@@ -8,7 +8,7 @@ selection and inbound call routing.
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
-from sqlalchemy import update
+from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.future import select
 
@@ -446,3 +446,243 @@ class TelephonyPhoneNumberClient(BaseDBClient):
             )
             .values(is_default_caller_id=False)
         )
+
+    async def list_platform_numbers(
+        self, organization_id: int
+    ) -> List[Dict[str, Any]]:
+        """List platform inventory numbers visible to an organization.
+
+        Shared trial numbers are visible to everyone.
+        Dedicated numbers are visible if unassigned OR if assigned to this organization.
+        """
+        async with self.async_session() as session:
+            # 1. Check all numbers currently claimed / active in this organization's workspace
+            claimed_addresses_stmt = select(TelephonyPhoneNumberModel.address_normalized).where(
+                TelephonyPhoneNumberModel.organization_id == organization_id,
+                TelephonyPhoneNumberModel.is_active == True,
+            )
+            claimed_addresses = set((await session.execute(claimed_addresses_stmt)).scalars().all())
+
+            # 2. Select platform inventory numbers
+            stmt = (
+                select(TelephonyPhoneNumberModel, TelephonyConfigurationModel)
+                .join(
+                    TelephonyConfigurationModel,
+                    TelephonyPhoneNumberModel.telephony_configuration_id
+                    == TelephonyConfigurationModel.id,
+                )
+                .where(
+                    TelephonyPhoneNumberModel.is_platform_inventory == True,
+                    TelephonyPhoneNumberModel.is_active == True,
+                )
+                .order_by(
+                    TelephonyPhoneNumberModel.pool_type.desc(),
+                    TelephonyPhoneNumberModel.created_at,
+                )
+            )
+            result = await session.execute(stmt)
+            rows = result.all()
+
+            output = []
+            for num, config in rows:
+                is_shared_trial = num.pool_type == "shared_trial"
+                is_shared_multi_org = num.pool_type == "shared_multi_org"
+
+                # Check if this specific organization has claimed this number
+                is_claimed_by_you = (
+                    num.address_normalized in claimed_addresses
+                    or num.assigned_organization_id == organization_id
+                    or is_shared_trial
+                )
+
+                # Dedicated numbers assigned to another organization
+                is_assigned_to_other = (
+                    not is_shared_trial
+                    and not is_shared_multi_org
+                    and num.assigned_organization_id is not None
+                    and num.assigned_organization_id != organization_id
+                )
+
+                if is_assigned_to_other:
+                    continue
+
+                output.append(
+                    {
+                        "id": num.id,
+                        "phone_number": num.address,
+                        "carrier": config.provider,
+                        "pool_type": num.pool_type,
+                        "monthly_price_cents": num.monthly_price_cents,
+                        "in_use": is_claimed_by_you if is_shared_multi_org else (not is_shared_trial and (num.assigned_organization_id is not None)),
+                        "is_claimed_by_you": is_claimed_by_you,
+                        "country_code": num.country_code,
+                        "telephony_configuration_id": num.telephony_configuration_id,
+                    }
+                )
+            return output
+
+    async def list_all_platform_inventory(self) -> List[Dict[str, Any]]:
+        """List all platform inventory numbers for superadmin view."""
+        async with self.async_session() as session:
+            stmt = (
+                select(TelephonyPhoneNumberModel, TelephonyConfigurationModel)
+                .join(
+                    TelephonyConfigurationModel,
+                    TelephonyPhoneNumberModel.telephony_configuration_id
+                    == TelephonyConfigurationModel.id,
+                )
+                .where(TelephonyPhoneNumberModel.is_platform_inventory == True)
+                .order_by(TelephonyPhoneNumberModel.created_at.desc())
+            )
+            result = await session.execute(stmt)
+            rows = result.all()
+
+            from sqlalchemy import func
+            claimed_counts_stmt = (
+                select(
+                    TelephonyPhoneNumberModel.address_normalized,
+                    func.count(TelephonyPhoneNumberModel.id).label("claim_count")
+                )
+                .where(
+                    TelephonyPhoneNumberModel.is_platform_inventory == False,
+                    TelephonyPhoneNumberModel.is_active == True,
+                )
+                .group_by(TelephonyPhoneNumberModel.address_normalized)
+            )
+            claimed_counts = dict((await session.execute(claimed_counts_stmt)).all())
+
+            return [
+                {
+                    "id": num.id,
+                    "phone_number": num.address,
+                    "carrier": config.provider,
+                    "configuration_id": config.id,
+                    "configuration_name": config.name,
+                    "pool_type": num.pool_type,
+                    "monthly_price_cents": num.monthly_price_cents,
+                    "assigned_organization_id": num.assigned_organization_id,
+                    "claimed_count": claimed_counts.get(num.address_normalized, 1 if num.assigned_organization_id else 0),
+                    "is_active": num.is_active,
+                    "created_at": num.created_at.isoformat() if num.created_at else None,
+                }
+                for num, config in rows
+            ]
+
+    async def claim_platform_number(
+        self,
+        phone_number_id: int,
+        organization_id: int,
+        set_as_default: bool = True,
+    ) -> Dict[str, Any]:
+        """Claim a platform number for an organization and provision a linked config."""
+        async with self.async_session() as session:
+            num = await session.get(TelephonyPhoneNumberModel, phone_number_id)
+            if not num or not num.is_platform_inventory:
+                raise ValueError("Platform number not found")
+
+            # Dedicated numbers: only one organization can claim
+            if num.pool_type not in ("shared_trial", "shared_multi_org"):
+                if num.assigned_organization_id is not None and num.assigned_organization_id != organization_id:
+                    raise ValueError("This number has already been claimed by another organization")
+                num.assigned_organization_id = organization_id
+
+            # Multi-org shared numbers: track claimed orgs in metadata without exclusive lock
+            if num.pool_type == "shared_multi_org":
+                meta = dict(num.extra_metadata or {})
+                claimed_orgs = list(meta.get("claimed_org_ids", []))
+                if organization_id not in claimed_orgs:
+                    claimed_orgs.append(organization_id)
+                    meta["claimed_org_ids"] = claimed_orgs
+                    num.extra_metadata = meta
+                if num.assigned_organization_id is None:
+                    num.assigned_organization_id = organization_id
+
+            # Also check if organization already has a linked platform config, or clone/bind one
+            source_config = await session.get(
+                TelephonyConfigurationModel, num.telephony_configuration_id
+            )
+            if not source_config:
+                raise ValueError("Source telephony configuration not found")
+
+            # If setting as default outbound, clear previous defaults for the org
+            from sqlalchemy import update
+            if set_as_default:
+                await session.execute(
+                    update(TelephonyConfigurationModel)
+                    .where(TelephonyConfigurationModel.organization_id == organization_id)
+                    .values(is_default_outbound=False)
+                )
+
+            # Find or create a matching telephony config inside user's org
+            stmt = select(TelephonyConfigurationModel).where(
+                TelephonyConfigurationModel.organization_id == organization_id,
+                TelephonyConfigurationModel.name == f"Platform - {source_config.name}",
+            )
+            existing_org_config = (await session.execute(stmt)).scalar_one_or_none()
+
+            if not existing_org_config:
+                existing_org_config = TelephonyConfigurationModel(
+                    organization_id=organization_id,
+                    name=f"Platform - {source_config.name}",
+                    provider=source_config.provider,
+                    credentials=source_config.credentials,
+                    is_default_outbound=set_as_default,
+                )
+                session.add(existing_org_config)
+                await session.flush()
+            elif set_as_default:
+                existing_org_config.is_default_outbound = True
+
+            # If setting as default caller ID, clear previous default callers in this config
+            if set_as_default:
+                await session.execute(
+                    update(TelephonyPhoneNumberModel)
+                    .where(TelephonyPhoneNumberModel.telephony_configuration_id == existing_org_config.id)
+                    .values(is_default_caller_id=False)
+                )
+
+            # Ensure phone number copy exists in organization's telephony config for campaigns
+            stmt_num = select(TelephonyPhoneNumberModel).where(
+                TelephonyPhoneNumberModel.organization_id == organization_id,
+                TelephonyPhoneNumberModel.address_normalized == num.address_normalized,
+            )
+            org_num = (await session.execute(stmt_num)).scalar_one_or_none()
+            if not org_num:
+                org_num = TelephonyPhoneNumberModel(
+                    organization_id=organization_id,
+                    telephony_configuration_id=existing_org_config.id,
+                    address=num.address,
+                    address_normalized=num.address_normalized,
+                    address_type=num.address_type,
+                    country_code=num.country_code,
+                    label=f"Claimed {num.address}",
+                    is_active=True,
+                    is_default_caller_id=set_as_default,
+                    pool_type=num.pool_type,
+                    is_platform_inventory=False,
+                )
+                session.add(org_num)
+            else:
+                org_num.telephony_configuration_id = existing_org_config.id
+                org_num.is_active = True
+                if set_as_default:
+                    org_num.is_default_caller_id = True
+
+            num_id = num.id
+            num_address = str(num.address)
+            num_pool_type = str(num.pool_type)
+            carrier = str(source_config.provider) if source_config.provider else "carrier"
+            assigned_config_id = int(existing_org_config.id)
+
+            await session.commit()
+
+            return {
+                "id": num_id,
+                "phone_number": num_address,
+                "carrier": carrier,
+                "pool_type": num_pool_type,
+                "organization_id": organization_id,
+                "telephony_configuration_id": assigned_config_id,
+                "message": f"Successfully provisioned {num_address} into your workspace!",
+            }
+

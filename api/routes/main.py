@@ -1,20 +1,27 @@
 import secrets
 from typing import Annotated
 
-from fastapi import APIRouter, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from loguru import logger
 from pydantic import BaseModel
+
+from api.db.models import UserModel
+from api.services.auth.depends import get_user_with_selected_organization
 
 from api.routes.agent_stream import router as agent_stream_router
 from api.routes.auth import router as auth_router
 from api.routes.campaign import router as campaign_router
 from api.routes.credentials import router as credentials_router
+from api.routes.dashboard import router as dashboard_router
 from api.routes.folder import router as folder_router
 from api.routes.knowledge_base import router as knowledge_base_router
 from api.routes.node_types import router as node_types_router
 from api.routes.organization import router as organization_router
 from api.routes.organization_usage import router as organization_usage_router
+from api.routes.payments import router as payments_router
+from api.routes.platform_numbers import router as platform_numbers_router
 from api.routes.public_agent import router as public_agent_router
+
 from api.routes.public_download import router as public_download_router
 from api.routes.public_embed import router as public_embed_router
 from api.routes.public_embed_chat import router as public_embed_chat_router
@@ -24,11 +31,14 @@ from api.routes.service_keys import router as service_keys_router
 from api.routes.superuser import router as superuser_router
 from api.routes.telephony import router as telephony_router
 from api.routes.tool import router as tool_router
+from api.routes.tts_cache import router as tts_cache_router
 from api.routes.turn_credentials import router as turn_credentials_router
 from api.routes.user import router as user_router
 from api.routes.webrtc_signaling import router as webrtc_signaling_router
 from api.routes.workflow import router as workflow_router
 from api.routes.workflow_embed import router as workflow_embed_router
+from api.routes.leads import router as leads_router
+from api.routes.contacts import router as contacts_router
 from api.routes.workflow_recording import router as workflow_recording_router
 from api.routes.workflow_text_chat import router as workflow_text_chat_router
 from api.services.integrations import all_routers
@@ -38,6 +48,9 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
+router.include_router(leads_router)
+router.include_router(contacts_router)
+router.include_router(dashboard_router)
 router.include_router(telephony_router)
 router.include_router(superuser_router)
 router.include_router(workflow_router)
@@ -50,6 +63,8 @@ router.include_router(organization_router)
 router.include_router(s3_router)
 router.include_router(service_keys_router)
 router.include_router(organization_usage_router)
+router.include_router(payments_router)
+router.include_router(platform_numbers_router)
 router.include_router(reports_router)
 router.include_router(webrtc_signaling_router)
 router.include_router(turn_credentials_router)
@@ -60,6 +75,7 @@ router.include_router(public_download_router)
 router.include_router(workflow_embed_router)
 router.include_router(knowledge_base_router)
 router.include_router(workflow_recording_router)
+router.include_router(tts_cache_router)
 router.include_router(folder_router)
 router.include_router(auth_router)
 router.include_router(node_types_router)
@@ -67,6 +83,35 @@ router.include_router(agent_stream_router)
 
 for _integration_router in all_routers():
     router.include_router(_integration_router)
+
+
+@router.get("/organization_usage")
+@router.get("/organization_usage/")
+async def get_legacy_organization_usage(
+    user: UserModel = Depends(get_user_with_selected_organization),
+):
+    from api.services.plan_service import plan_service
+
+    org_id = user.selected_organization_id
+    if not org_id:
+        return {
+            "balance_usd": 0.0,
+            "total_minutes": 0,
+            "used_minutes": 0.0,
+            "minutes_remaining": 0.0,
+        }
+    limits = await plan_service.get_effective_limits(org_id)
+    total_minutes = (
+        limits.included_minutes
+        if limits.included_minutes > 0
+        else int(limits.wallet_balance_usd / 0.125)
+    )
+    return {
+        "balance_usd": round(limits.wallet_balance_usd, 4),
+        "total_minutes": total_minutes,
+        "used_minutes": round(limits.monthly_minutes_used, 2),
+        "minutes_remaining": round(limits.minutes_remaining, 2),
+    }
 
 
 class HealthResponse(BaseModel):
@@ -87,6 +132,8 @@ class HealthResponse(BaseModel):
     # be baked into the browser bundle at build time. Both are public values.
     stack_project_id: str | None = None
     stack_publishable_client_key: str | None = None
+    stack_api_url: str | None = None
+    stack_secret_server_key: str | None = None
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -99,8 +146,10 @@ async def health() -> HealthResponse:
         ENABLE_COTURN,
         ENABLE_SIGNUP,
         FORCE_TURN_RELAY,
+        STACK_AUTH_API_URL,
         STACK_AUTH_PROJECT_ID,
         STACK_PUBLISHABLE_CLIENT_KEY,
+        STACK_SECRET_SERVER_KEY,
     )
     from api.utils.common import get_backend_endpoints, is_local_or_private_url
 
@@ -131,6 +180,8 @@ async def health() -> HealthResponse:
         stack_publishable_client_key=(
             STACK_PUBLISHABLE_CLIENT_KEY if is_stack else None
         ),
+        stack_api_url=STACK_AUTH_API_URL if is_stack else None,
+        stack_secret_server_key=STACK_SECRET_SERVER_KEY if is_stack else None,
     )
 
 
@@ -234,6 +285,34 @@ async def autoscale_metric(
     return AutoscaleMetricResponse(value=calls + max(0, buffer))
 
 
+@router.get("/plans")
+async def list_public_saas_plans():
+    """List all publicly active SaaS subscription plans for landing page & prospective customers."""
+    from api.services.plan_service import plan_service, normalize_plan_features
+
+    plans = await plan_service.list_plans(include_inactive=False)
+    return [
+        {
+            "id": p.id,
+            "slug": p.slug,
+            "name": p.name,
+            "description": p.description,
+            "price_usd": p.price_usd,
+            "price_inr": p.price_inr,
+            "billing_interval": p.billing_interval,
+            "included_minutes": p.included_minutes,
+            "max_concurrent_calls": p.max_concurrent_calls,
+            "max_agents": p.max_agents,
+            "overage_rate_per_minute_usd": p.overage_rate_per_minute_usd,
+            "allow_byok": p.allow_byok,
+            "features": normalize_plan_features(p.features),
+        }
+        for p in plans
+        if p.is_public
+    ]
+
+
+
 @router.get("/metrics", include_in_schema=False)
 def prometheus_metrics(
     x_dograh_devops_secret: Annotated[
@@ -257,3 +336,7 @@ def prometheus_metrics(
         content=runtime.render(),
         headers={"Content-Type": CONTENT_TYPE_LATEST, "Cache-Control": "no-store"},
     )
+
+# Reload trigger for updated routes
+
+
