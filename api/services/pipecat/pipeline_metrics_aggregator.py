@@ -51,6 +51,8 @@ class PipelineMetricsAggregator(FrameProcessor):
                     await self._handle_llm_usage_metrics(data)
                 elif isinstance(data, TTSUsageMetricsData):
                     await self._handle_tts_usage_metrics(data)
+                elif isinstance(data, STTUsageMetricsData):
+                    await self._handle_stt_usage_metrics(data)
                 elif isinstance(data, LiveUsageMetricsData):
                     key = f"{data.processor}|||{data.model}"
                     self._live_usage_metrics[key] += data.seconds

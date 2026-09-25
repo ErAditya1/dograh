@@ -109,12 +109,12 @@ ENABLE_PROMETHEUS_METRICS = (
 RAZORPAY_KEY_ID = (
     os.getenv("RAZOR_PAY_API_KEY_ID")
     or os.getenv("RAZORPAY_KEY_ID")
-    or "rzp_test_2oYqLjGL99Pujg"
+    or ""
 )
 RAZORPAY_KEY_SECRET = (
     os.getenv("RAZOR_PAY_API_KEY_SECRET")
     or os.getenv("RAZORPAY_KEY_SECRET")
-    or "gdD5vGQPYbNz8LjJ23ulC2kx"
+    or ""
 )
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET") or "aditya"
 USD_TO_INR_RATE = float(os.getenv("USD_TO_INR_RATE", "86.0"))
