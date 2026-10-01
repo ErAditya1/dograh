@@ -275,6 +275,8 @@ class CreateCampaignRequest(BaseModel):
     record_calls: Optional[bool] = None
     contacts: Optional[List[Dict[str, Any]]] = None
     contact_ids: Optional[List[int]] = None
+    group_id: Optional[int] = None
+    group_ids: Optional[List[int]] = None
 
     @model_validator(mode="after")
     def validate_agent_selection(self):
@@ -645,7 +647,7 @@ async def create_campaign(
     source_id = request.source_id or f"direct_{user.selected_organization_id}_{uuid.uuid4()}"
     validation_result = None
 
-    if request.source_id:
+    if request.source_id and source_type == "csv":
         # Validate source data if CSV was uploaded
         sync_service = get_sync_service(source_type)
         validation_result = await sync_service.validate_source(
@@ -822,6 +824,41 @@ async def create_campaign(
             )
             contacts_to_dial = [dict(r._mapping) for r in res.fetchall()]
             await session.commit()
+
+    elif request.group_ids or request.group_id:
+        target_groups = list(request.group_ids or [])
+        if request.group_id and request.group_id not in target_groups:
+            target_groups.append(request.group_id)
+
+        async with db_client.async_session() as session:
+            res = await session.execute(
+                text(
+                    """
+                    SELECT DISTINCT c.id, c.name, c.phone, c.email, c.company, c.city
+                    FROM organization_contacts c
+                    INNER JOIN contact_group_members m ON c.id = m.contact_id
+                    WHERE m.organization_id = :org_id AND m.group_id = ANY(:group_ids)
+                    """
+                ),
+                {"org_id": user.selected_organization_id, "group_ids": target_groups},
+            )
+            contacts_to_dial = [dict(r._mapping) for r in res.fetchall()]
+            if contacts_to_dial:
+                await session.execute(
+                    text(
+                        """
+                        UPDATE organization_contacts
+                        SET campaign_id = :campaign_id, updated_at = NOW()
+                        WHERE organization_id = :org_id AND id = ANY(:ids)
+                        """
+                    ),
+                    {
+                        "org_id": user.selected_organization_id,
+                        "ids": [c["id"] for c in contacts_to_dial],
+                        "campaign_id": campaign.id,
+                    },
+                )
+                await session.commit()
 
     elif request.contacts:
         seen_phones = set()

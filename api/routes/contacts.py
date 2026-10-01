@@ -57,6 +57,46 @@ END;
 $$;
 """
 
+CREATE_GROUPS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS contact_groups (
+    id SERIAL PRIMARY KEY,
+    organization_id INTEGER NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    color VARCHAR(30) DEFAULT '#0F6E6E',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT uq_org_group_name UNIQUE (organization_id, name)
+)
+"""
+
+CREATE_GROUPS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_contact_groups_org_id ON contact_groups(organization_id)
+"""
+
+CREATE_GROUP_MEMBERS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS contact_group_members (
+    id SERIAL PRIMARY KEY,
+    organization_id INTEGER NOT NULL,
+    group_id INTEGER NOT NULL REFERENCES contact_groups(id) ON DELETE CASCADE,
+    contact_id INTEGER NOT NULL REFERENCES organization_contacts(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT uq_group_contact UNIQUE (group_id, contact_id)
+)
+"""
+
+CREATE_GROUP_MEMBERS_IDX_GROUP_SQL = """
+CREATE INDEX IF NOT EXISTS idx_group_members_group_id ON contact_group_members(group_id)
+"""
+
+CREATE_GROUP_MEMBERS_IDX_CONTACT_SQL = """
+CREATE INDEX IF NOT EXISTS idx_group_members_contact_id ON contact_group_members(contact_id)
+"""
+
+CREATE_GROUP_MEMBERS_IDX_ORG_SQL = """
+CREATE INDEX IF NOT EXISTS idx_group_members_org_id ON contact_group_members(organization_id)
+"""
+
 DEFAULT_CONTACTS = []
 
 
@@ -82,18 +122,62 @@ async def ensure_table():
         async with db_client.async_session() as session:
             await session.execute(text(CREATE_TABLE_SQL))
             await session.commit()
+    except Exception as e:
+        logger.warning(f"ensure_table CREATE_TABLE_SQL error: {e}")
+
+    try:
         async with db_client.async_session() as session:
             await session.execute(text(CREATE_INDEX_SQL))
             await session.commit()
-        # Enforce uniqueness of phone per organization
+    except Exception as e:
+        logger.warning(f"ensure_table CREATE_INDEX_SQL error: {e}")
+
+    # Enforce uniqueness of phone per organization
+    try:
+        async with db_client.async_session() as session:
+            await session.execute(text(CREATE_UNIQUE_INDEX_SQL))
+            await session.commit()
+    except Exception as ce:
+        logger.debug(f"uq_org_contacts_org_phone note: {ce}")
+
+    # Ensure groups and group_members tables exist (each executed separately for asyncpg compatibility)
+    group_ddls = [
+        ("contact_groups", CREATE_GROUPS_TABLE_SQL),
+        ("idx_contact_groups_org_id", CREATE_GROUPS_INDEX_SQL),
+        ("contact_group_members", CREATE_GROUP_MEMBERS_TABLE_SQL),
+        ("idx_group_members_group_id", CREATE_GROUP_MEMBERS_IDX_GROUP_SQL),
+        ("idx_group_members_contact_id", CREATE_GROUP_MEMBERS_IDX_CONTACT_SQL),
+        ("idx_group_members_org_id", CREATE_GROUP_MEMBERS_IDX_ORG_SQL),
+    ]
+    for name, stmt in group_ddls:
         try:
             async with db_client.async_session() as session:
-                await session.execute(text(CREATE_UNIQUE_INDEX_SQL))
+                await session.execute(text(stmt))
                 await session.commit()
-        except Exception as ce:
-            logger.debug(f"uq_org_contacts_org_phone note: {ce}")
-    except Exception as e:
-        logger.warning(f"ensure_table for organization_contacts error: {e}")
+        except Exception as ge:
+            logger.warning(f"ensure_table {name} DDL error: {ge}")
+
+
+class ContactGroupCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    description: Optional[str] = None
+    color: Optional[str] = "#0F6E6E"
+
+
+class ContactGroupUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    color: Optional[str] = None
+
+
+class AddContactsToGroupRequest(BaseModel):
+    contact_ids: List[int]
+
+
+class AddNumbersToGroupRequest(BaseModel):
+    numbers: Optional[List[str]] = None
+    text: Optional[str] = None
+    contact_ids: Optional[List[int]] = None
 
 
 class ContactCreateRequest(BaseModel):
@@ -104,10 +188,14 @@ class ContactCreateRequest(BaseModel):
     city: Optional[str] = None
     status: Optional[str] = "valid"
     campaign_id: Optional[int] = None
+    group_id: Optional[int] = None
 
 
 class BulkContactsRequest(BaseModel):
     contacts: List[ContactCreateRequest]
+    group_id: Optional[int] = None
+    new_group_name: Optional[str] = None
+    new_group_color: Optional[str] = "#0F6E6E"
 
 
 class BulkDeleteRequest(BaseModel):
@@ -135,6 +223,19 @@ def _row_to_contact(row: Any) -> Dict[str, Any]:
     }
 
 
+def _row_to_group(row: Any) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "organization_id": row.organization_id,
+        "name": row.name,
+        "description": row.description or "",
+        "color": row.color or "#0F6E6E",
+        "member_count": getattr(row, "member_count", 0),
+        "created_at": row.created_at.isoformat() if hasattr(row, "created_at") and row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if hasattr(row, "updated_at") and row.updated_at else None,
+    }
+
+
 @router.get("")
 @router.get("/")
 async def list_organization_contacts(
@@ -143,6 +244,7 @@ async def list_organization_contacts(
     q: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     campaign_id: Optional[int] = Query(None),
+    group_id: Optional[int] = Query(None),
     user: UserModel = Depends(get_user),
 ):
     """
@@ -157,6 +259,12 @@ async def list_organization_contacts(
     if campaign_id is not None:
         where_clauses.append("campaign_id = :campaign_id")
         params["campaign_id"] = campaign_id
+
+    if group_id is not None:
+        where_clauses.append(
+            "id IN (SELECT contact_id FROM contact_group_members WHERE group_id = :group_id AND organization_id = :org_id)"
+        )
+        params["group_id"] = group_id
 
     if status and status != "all":
         if status == "called":
@@ -249,6 +357,17 @@ async def create_organization_contact(
             },
         )
         row = res.fetchone()
+        if req.group_id and row:
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO contact_group_members (organization_id, group_id, contact_id, created_at)
+                    VALUES (:org_id, :group_id, :contact_id, NOW())
+                    ON CONFLICT (group_id, contact_id) DO NOTHING
+                    """
+                ),
+                {"org_id": org_id, "group_id": req.group_id, "contact_id": row.id},
+            )
         await session.commit()
         return _row_to_contact(row)
 
@@ -265,6 +384,23 @@ async def bulk_import_organization_contacts(
     inserted: List[Dict[str, Any]] = []
     seen_in_batch = set()
     async with db_client.async_session() as session:
+        target_group_id = req.group_id
+        if req.new_group_name and req.new_group_name.strip():
+            g_res = await session.execute(
+                text(
+                    """
+                    INSERT INTO contact_groups (organization_id, name, color, created_at, updated_at)
+                    VALUES (:org_id, :name, :color, NOW(), NOW())
+                    ON CONFLICT (organization_id, name) DO UPDATE SET updated_at = NOW()
+                    RETURNING id
+                    """
+                ),
+                {"org_id": org_id, "name": req.new_group_name.strip(), "color": req.new_group_color or "#0F6E6E"},
+            )
+            g_row = g_res.fetchone()
+            if g_row:
+                target_group_id = g_row.id
+
         for c in req.contacts:
             norm_phone = normalize_phone_number(c.phone)
             if not norm_phone or norm_phone in seen_in_batch:
@@ -299,9 +435,20 @@ async def bulk_import_organization_contacts(
             row = res.fetchone()
             if row:
                 inserted.append(_row_to_contact(row))
+                if target_group_id:
+                    await session.execute(
+                        text(
+                            """
+                            INSERT INTO contact_group_members (organization_id, group_id, contact_id, created_at)
+                            VALUES (:org_id, :group_id, :contact_id, NOW())
+                            ON CONFLICT (group_id, contact_id) DO NOTHING
+                            """
+                        ),
+                        {"org_id": org_id, "group_id": target_group_id, "contact_id": row.id},
+                    )
         await session.commit()
 
-    return {"count": len(inserted), "contacts": inserted}
+    return {"count": len(inserted), "contacts": inserted, "group_id": target_group_id}
 
 
 @router.post("/delete-bulk")
@@ -353,3 +500,403 @@ async def assign_contacts_to_campaign(
         await session.commit()
 
     return {"updated": len(req.ids), "campaign_id": req.campaign_id}
+
+
+# -------------------- CONTACT GROUPS ENDPOINTS --------------------
+
+@router.get("/groups")
+async def list_contact_groups(
+    user: UserModel = Depends(get_user),
+):
+    """List all contact groups with real-time member counts for the organization."""
+    await ensure_table()
+    org_id = user.selected_organization_id or 1
+
+    async with db_client.async_session() as session:
+        query = text(
+            """
+            SELECT g.id, g.organization_id, g.name, g.description, g.color, g.created_at, g.updated_at,
+                   COUNT(m.contact_id) as member_count
+            FROM contact_groups g
+            LEFT JOIN contact_group_members m ON g.id = m.group_id AND m.organization_id = :org_id
+            WHERE g.organization_id = :org_id
+            GROUP BY g.id, g.organization_id, g.name, g.description, g.color, g.created_at, g.updated_at
+            ORDER BY g.name ASC
+            """
+        )
+        res = await session.execute(query, {"org_id": org_id})
+        rows = res.fetchall()
+        return [_row_to_group(r) for r in rows]
+
+
+@router.post("/groups")
+async def create_contact_group(
+    req: ContactGroupCreate,
+    user: UserModel = Depends(get_user),
+):
+    """Create a new contact group."""
+    await ensure_table()
+    org_id = user.selected_organization_id or 1
+
+    try:
+        async with db_client.async_session() as session:
+            exist_res = await session.execute(
+                text("SELECT id FROM contact_groups WHERE organization_id = :org_id AND name ILIKE :name"),
+                {"org_id": org_id, "name": req.name.strip()},
+            )
+            if exist_res.fetchone():
+                raise HTTPException(status_code=400, detail=f"Group '{req.name}' already exists.")
+
+            res = await session.execute(
+                text(
+                    """
+                    INSERT INTO contact_groups (organization_id, name, description, color, created_at, updated_at)
+                    VALUES (:org_id, :name, :description, :color, NOW(), NOW())
+                    RETURNING id, organization_id, name, description, color, created_at, updated_at
+                    """
+                ),
+                {
+                    "org_id": org_id,
+                    "name": req.name.strip(),
+                    "description": req.description or "",
+                    "color": req.color or "#0F6E6E",
+                },
+            )
+            row = res.fetchone()
+            await session.commit()
+            return _row_to_group(row)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating contact group: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create group: {str(e)}")
+
+
+@router.get("/groups/{group_id}")
+async def get_contact_group(
+    group_id: int,
+    user: UserModel = Depends(get_user),
+):
+    """Get group details by ID."""
+    await ensure_table()
+    org_id = user.selected_organization_id or 1
+
+    async with db_client.async_session() as session:
+        res = await session.execute(
+            text(
+                """
+                SELECT g.id, g.organization_id, g.name, g.description, g.color, g.created_at, g.updated_at,
+                       COUNT(m.contact_id) as member_count
+                FROM contact_groups g
+                LEFT JOIN contact_group_members m ON g.id = m.group_id AND m.organization_id = :org_id
+                WHERE g.organization_id = :org_id AND g.id = :group_id
+                GROUP BY g.id, g.organization_id, g.name, g.description, g.color, g.created_at, g.updated_at
+                """
+            ),
+            {"org_id": org_id, "group_id": group_id},
+        )
+        row = res.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Contact group not found")
+        return _row_to_group(row)
+
+
+@router.put("/groups/{group_id}")
+async def update_contact_group(
+    group_id: int,
+    req: ContactGroupUpdate,
+    user: UserModel = Depends(get_user),
+):
+    """Update contact group name, description, or color."""
+    await ensure_table()
+    org_id = user.selected_organization_id or 1
+
+    updates = []
+    params: Dict[str, Any] = {"org_id": org_id, "group_id": group_id}
+
+    if req.name is not None:
+        updates.append("name = :name")
+        params["name"] = req.name.strip()
+    if req.description is not None:
+        updates.append("description = :description")
+        params["description"] = req.description.strip()
+    if req.color is not None:
+        updates.append("color = :color")
+        params["color"] = req.color.strip()
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+
+    updates.append("updated_at = NOW()")
+    set_sql = ", ".join(updates)
+
+    async with db_client.async_session() as session:
+        res = await session.execute(
+            text(
+                f"""
+                UPDATE contact_groups
+                SET {set_sql}
+                WHERE organization_id = :org_id AND id = :group_id
+                RETURNING id, organization_id, name, description, color, created_at, updated_at
+                """
+            ),
+            params,
+        )
+        row = res.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Contact group not found")
+        await session.commit()
+        return _row_to_group(row)
+
+
+@router.delete("/groups/{group_id}")
+async def delete_contact_group(
+    group_id: int,
+    user: UserModel = Depends(get_user),
+):
+    """Delete a contact group. Note: contacts themselves remain intact in directory."""
+    await ensure_table()
+    org_id = user.selected_organization_id or 1
+
+    async with db_client.async_session() as session:
+        res = await session.execute(
+            text("DELETE FROM contact_groups WHERE organization_id = :org_id AND id = :group_id RETURNING id"),
+            {"org_id": org_id, "group_id": group_id},
+        )
+        row = res.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Contact group not found")
+        await session.commit()
+        return {"success": True, "deleted_group_id": group_id}
+
+
+@router.get("/groups/{group_id}/contacts")
+async def get_group_contacts(
+    group_id: int,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    user: UserModel = Depends(get_user),
+):
+    """Get contacts belonging to a specific group."""
+    await ensure_table()
+    org_id = user.selected_organization_id or 1
+
+    async with db_client.async_session() as session:
+        query = text(
+            """
+            SELECT c.id, c.name, c.phone, c.email, c.company, c.city, c.status, c.called, c.last_called_at, c.intent, c.campaign_id
+            FROM organization_contacts c
+            INNER JOIN contact_group_members m ON c.id = m.contact_id
+            WHERE m.organization_id = :org_id AND m.group_id = :group_id
+            ORDER BY c.name ASC
+            LIMIT :limit OFFSET :offset
+            """
+        )
+        res = await session.execute(query, {"org_id": org_id, "group_id": group_id, "limit": limit, "offset": offset})
+        rows = res.fetchall()
+
+        count_res = await session.execute(
+            text("SELECT COUNT(*) FROM contact_group_members WHERE organization_id = :org_id AND group_id = :group_id"),
+            {"org_id": org_id, "group_id": group_id},
+        )
+        total_count = count_res.scalar() or 0
+
+        return {
+            "contacts": [_row_to_contact(r) for r in rows],
+            "total_count": total_count,
+            "group_id": group_id,
+        }
+
+
+@router.post("/groups/{group_id}/contacts")
+async def add_contacts_to_group(
+    group_id: int,
+    req: AddContactsToGroupRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Add existing contacts to a group."""
+    if not req.contact_ids:
+        return {"added": 0}
+    await ensure_table()
+    org_id = user.selected_organization_id or 1
+
+    added = 0
+    async with db_client.async_session() as session:
+        g_check = await session.execute(
+            text("SELECT id FROM contact_groups WHERE organization_id = :org_id AND id = :group_id"),
+            {"org_id": org_id, "group_id": group_id},
+        )
+        if not g_check.fetchone():
+            raise HTTPException(status_code=404, detail="Contact group not found")
+
+        for cid in req.contact_ids:
+            res = await session.execute(
+                text(
+                    """
+                    INSERT INTO contact_group_members (organization_id, group_id, contact_id, created_at)
+                    VALUES (:org_id, :group_id, :contact_id, NOW())
+                    ON CONFLICT (group_id, contact_id) DO NOTHING
+                    RETURNING id
+                    """
+                ),
+                {"org_id": org_id, "group_id": group_id, "contact_id": cid},
+            )
+            if res.fetchone():
+                added += 1
+        await session.commit()
+
+    return {"added": added, "group_id": group_id}
+
+
+@router.delete("/groups/{group_id}/contacts")
+async def remove_contacts_from_group(
+    group_id: int,
+    req: AddContactsToGroupRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Remove contacts from a group."""
+    if not req.contact_ids:
+        return {"removed": 0}
+    await ensure_table()
+    org_id = user.selected_organization_id or 1
+
+    async with db_client.async_session() as session:
+        await session.execute(
+            text(
+                """
+                DELETE FROM contact_group_members
+                WHERE organization_id = :org_id AND group_id = :group_id AND contact_id = ANY(:ids)
+                """
+            ),
+            {"org_id": org_id, "group_id": group_id, "ids": req.contact_ids},
+        )
+        await session.commit()
+
+    return {"removed": len(req.contact_ids), "group_id": group_id}
+
+
+@router.post("/groups/{group_id}/add-numbers")
+async def add_numbers_to_group(
+    group_id: int,
+    req: AddNumbersToGroupRequest,
+    user: UserModel = Depends(get_user),
+):
+    """
+    Add phone numbers directly into an existing group with strict deduplication:
+    - If number is already in general directory, reuses existing contact without creating a duplicate.
+    - If number is new, creates contact in general directory.
+    - Links contact to the group. If already linked, gracefully skips without error.
+    """
+    await ensure_table()
+    org_id = user.selected_organization_id or 1
+
+    async with db_client.async_session() as session:
+        # Check group exists
+        g_check = await session.execute(
+            text("SELECT id, name FROM contact_groups WHERE organization_id = :org_id AND id = :group_id"),
+            {"org_id": org_id, "group_id": group_id},
+        )
+        group_row = g_check.fetchone()
+        if not group_row:
+            raise HTTPException(status_code=404, detail="Contact group not found")
+
+        # Parse raw input into candidate items: list of (phone, name)
+        candidates: List[tuple[str, str]] = []
+
+        if req.numbers:
+            for num in req.numbers:
+                if num and str(num).strip():
+                    candidates.append((str(num).strip(), "Customer"))
+
+        if req.text:
+            lines = [l.strip() for l in req.text.splitlines() if l.strip()]
+            for line in lines:
+                parts = [p.strip() for p in line.replace("\t", ",").split(",") if p.strip()]
+                if len(parts) >= 2:
+                    p0 = normalize_phone_number(parts[0])
+                    p1 = normalize_phone_number(parts[1])
+                    if p0:
+                        candidates.append((parts[0], parts[1]))
+                    elif p1:
+                        candidates.append((parts[1], parts[0]))
+                    else:
+                        candidates.append((parts[0], parts[1]))
+                else:
+                    candidates.append((line, "Customer"))
+
+        target_contact_ids: List[int] = list(req.contact_ids or [])
+        seen_phones: set[str] = set()
+        invalid_count = 0
+        existing_linked = 0
+        new_created = 0
+
+        for raw_phone, raw_name in candidates:
+            norm_phone = normalize_phone_number(raw_phone)
+            if not norm_phone or len(norm_phone) < 10:
+                invalid_count += 1
+                continue
+            if norm_phone in seen_phones:
+                continue
+            seen_phones.add(norm_phone)
+
+            # Check if contact already exists in directory
+            c_res = await session.execute(
+                text("SELECT id FROM organization_contacts WHERE organization_id = :org_id AND phone = :phone"),
+                {"org_id": org_id, "phone": norm_phone},
+            )
+            c_row = c_res.fetchone()
+            if c_row:
+                target_contact_ids.append(c_row.id)
+                existing_linked += 1
+            else:
+                ins_res = await session.execute(
+                    text(
+                        """
+                        INSERT INTO organization_contacts
+                        (organization_id, name, phone, status, called, created_at, updated_at)
+                        VALUES (:org_id, :name, :phone, 'valid', FALSE, NOW(), NOW())
+                        RETURNING id
+                        """
+                    ),
+                    {"org_id": org_id, "name": raw_name or "Customer", "phone": norm_phone},
+                )
+                ins_row = ins_res.fetchone()
+                if ins_row:
+                    target_contact_ids.append(ins_row.id)
+                    new_created += 1
+
+        # Now link all unique target_contact_ids into contact_group_members
+        unique_ids = list(dict.fromkeys(target_contact_ids))
+        added_count = 0
+        already_in_group_count = 0
+
+        for cid in unique_ids:
+            link_res = await session.execute(
+                text(
+                    """
+                    INSERT INTO contact_group_members (organization_id, group_id, contact_id, created_at)
+                    VALUES (:org_id, :group_id, :contact_id, NOW())
+                    ON CONFLICT (group_id, contact_id) DO NOTHING
+                    RETURNING id
+                    """
+                ),
+                {"org_id": org_id, "group_id": group_id, "contact_id": cid},
+            )
+            if link_res.fetchone():
+                added_count += 1
+            else:
+                already_in_group_count += 1
+
+        await session.commit()
+
+        return {
+            "success": True,
+            "group_id": group_id,
+            "group_name": group_row.name,
+            "added": added_count,
+            "already_in_group": already_in_group_count,
+            "existing_directory_linked": existing_linked,
+            "new_contacts_created": new_created,
+            "invalid_count": invalid_count,
+            "total_processed": len(seen_phones) + len(req.contact_ids or []),
+        }

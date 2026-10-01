@@ -1892,6 +1892,25 @@ class CreateBuiltinAgentRequest(BaseModel):
     conversion_goal: dict = {}
 
 
+class CreateCustomAgentFormRequest(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    category: Optional[str] = "Custom"
+    badge: Optional[str] = "Custom Caller"
+    first_message: Optional[str] = ""
+    system_prompt: Optional[str] = ""
+    language: Optional[str] = "en-IN"
+    voice_id: Optional[str] = "default"
+    call_forwarding_enabled: Optional[bool] = False
+    forwarding_phone_number: Optional[str] = None
+    forwarding_condition: Optional[str] = None
+    calendar_booking_enabled: Optional[bool] = False
+    calendar_url: Optional[str] = None
+    variables: list[dict] = []
+    conversion_goal: dict = {}
+    base_template_id: Optional[int] = None
+
+
 class ImportBuiltinAgentRequest(BaseModel):
     name: Optional[str] = None
 
@@ -1975,6 +1994,7 @@ def _format_agent_item(w: WorkflowModel) -> dict:
         "badge": w.builtin_badge or "Featured",
         "description": w.builtin_description or "",
         "is_default": bool(w.is_builtin),
+        "is_builtin": bool(w.is_builtin),
         "variables": formatted_vars,
         "conversion_goal": goal,
         "tested_by_admin": bool(w.tested_by_admin),
@@ -1984,6 +2004,12 @@ def _format_agent_item(w: WorkflowModel) -> dict:
         "voice_id": agent_data.get("voice", "default"),
         "first_message": agent_data.get("first_message", ""),
         "system_prompt": agent_data.get("system_prompt", ""),
+        "raw_prompt": agent_data.get("raw_prompt") or agent_data.get("system_prompt", ""),
+        "call_forwarding_enabled": bool(agent_data.get("call_forwarding_enabled", False)),
+        "forwarding_phone_number": agent_data.get("forwarding_phone_number", ""),
+        "forwarding_condition": agent_data.get("forwarding_condition", ""),
+        "calendar_booking_enabled": bool(agent_data.get("calendar_booking_enabled", False)),
+        "calendar_url": agent_data.get("calendar_url", ""),
     }
 
 
@@ -2345,6 +2371,278 @@ async def import_builtin_agent(
             "workflow_id": new_id,
             "name": new_name,
         }
+
+
+@router.get("/custom")
+async def list_custom_agents(
+    user: UserModel = Depends(get_user),
+    limit: Optional[int] = Query(50),
+):
+    """
+    Fetch all custom AI voice callers created by and owned by the calling user's organization.
+    Does NOT return platform built-in templates.
+    """
+    await _ensure_builtin_columns()
+    async with db_client.async_session() as session:
+        org_id = user.selected_organization_id
+        if not org_id:
+            return []
+
+        stmt = (
+            select(WorkflowModel)
+            .where(
+                and_(
+                    WorkflowModel.organization_id == org_id,
+                    WorkflowModel.is_builtin == False,
+                    WorkflowModel.status == WorkflowStatus.ACTIVE.value,
+                )
+            )
+            .order_by(WorkflowModel.id.desc())
+        )
+        res = await session.execute(stmt)
+        workflows = res.scalars().all()
+        return [_format_agent_item(w) for w in workflows[:limit]]
+
+
+@router.post("/custom")
+@router.post("/custom/create")
+async def create_custom_agent(
+    request: CreateCustomAgentFormRequest,
+    user: UserModel = Depends(get_user),
+):
+    """
+    Create a custom AI voice caller for the user's organization using a simplified form-based interface.
+    Automatically generates the underlying startCall node and workflow definition.
+    """
+    await _ensure_builtin_columns()
+    org_id = user.selected_organization_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="User must have an active organization selected")
+
+    async with db_client.async_session() as session:
+        raw_prompt = request.system_prompt.strip() if request.system_prompt else "You are a courteous, professional AI voice caller representing your company."
+        prompt_sections = [raw_prompt]
+
+        if request.call_forwarding_enabled and request.forwarding_phone_number:
+            condition = request.forwarding_condition.strip() if request.forwarding_condition else "When the customer requests to speak with a human agent, supervisor, or manager"
+            prompt_sections.append(
+                f"\n\n### CALL FORWARDING / TRANSFER INSTRUCTIONS:\n"
+                f"- Trigger Condition: {condition}\n"
+                f"- Action: Politely say 'I will transfer you right away to our team specialist. Please hold the line for just a moment.', then forward the call to {request.forwarding_phone_number}."
+            )
+
+        if request.calendar_booking_enabled and request.calendar_url:
+            prompt_sections.append(
+                f"\n\n### APPOINTMENT / CALENDAR SCHEDULING:\n"
+                f"- When the customer wants to schedule or book an appointment, confirm their preferred day and time.\n"
+                f"- Meeting booking calendar URL: {request.calendar_url}"
+            )
+
+        compiled_system_prompt = "\n".join(prompt_sections)
+        greeting = request.first_message.strip() if request.first_message else None
+
+        node_data = {
+            "name": request.name.strip(),
+            "prompt": compiled_system_prompt,
+            "greeting": greeting,
+            "greeting_type": "text" if greeting else None,
+            "allow_interrupt": True,
+            "is_start": True,
+            "wait_for_user_response": False if greeting else True,
+            "first_message": greeting or "",
+            "system_prompt": compiled_system_prompt,
+            "raw_prompt": raw_prompt,
+            "language": request.language or "en-IN",
+            "voice": request.voice_id or "default",
+            "call_type": "outbound",
+            "call_forwarding_enabled": request.call_forwarding_enabled or False,
+            "forwarding_phone_number": request.forwarding_phone_number or "",
+            "forwarding_condition": request.forwarding_condition or "",
+            "calendar_booking_enabled": request.calendar_booking_enabled or False,
+            "calendar_url": request.calendar_url or "",
+        }
+
+        nodes = [
+            {
+                "id": "start_1",
+                "type": "startCall",
+                "position": {"x": 250, "y": 150},
+                "data": node_data,
+            }
+        ]
+        definition = {"nodes": nodes, "edges": []}
+
+        new_workflow = WorkflowModel(
+            name=request.name.strip(),
+            workflow_uuid=str(uuid.uuid4()),
+            user_id=user.id,
+            organization_id=org_id,
+            status=WorkflowStatus.ACTIVE.value,
+            workflow_definition=definition,
+            is_builtin=False,
+            builtin_category=request.category or "Custom",
+            builtin_badge=request.badge or "Custom Caller",
+            builtin_description=request.description or "",
+            builtin_variables=request.variables or [],
+            builtin_conversion_goal=request.conversion_goal or {},
+            tested_by_admin=False,
+        )
+        session.add(new_workflow)
+        await session.flush()
+
+        wf_def_row = WorkflowDefinitionModel(
+            workflow_id=new_workflow.id,
+            workflow_json=definition,
+            is_current=True,
+            status="published",
+            version_number=1,
+            published_at=datetime.now(),
+            workflow_configurations={},
+            template_context_variables={},
+        )
+        session.add(wf_def_row)
+        await session.flush()
+        new_workflow.released_definition_id = wf_def_row.id
+
+        formatted_result = _format_agent_item(new_workflow)
+        await session.commit()
+        return formatted_result
+
+
+@router.put("/custom/{workflow_id}")
+async def update_custom_agent(
+    workflow_id: int,
+    request: CreateCustomAgentFormRequest,
+    user: UserModel = Depends(get_user),
+):
+    """
+    Update an existing custom AI voice caller for the user's organization using form inputs.
+    """
+    await _ensure_builtin_columns()
+    org_id = user.selected_organization_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="User must have an active organization selected")
+
+    async with db_client.async_session() as session:
+        stmt = select(WorkflowModel).where(
+            and_(
+                WorkflowModel.id == workflow_id,
+                WorkflowModel.organization_id == org_id,
+                WorkflowModel.is_builtin == False,
+            )
+        )
+        res = await session.execute(stmt)
+        workflow = res.scalar_one_or_none()
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Custom caller not found or permission denied")
+
+        raw_prompt = request.system_prompt.strip() if request.system_prompt else "You are a courteous, professional AI voice caller representing your company."
+        prompt_sections = [raw_prompt]
+
+        if request.call_forwarding_enabled and request.forwarding_phone_number:
+            condition = request.forwarding_condition.strip() if request.forwarding_condition else "When the customer requests to speak with a human agent, supervisor, or manager"
+            prompt_sections.append(
+                f"\n\n### CALL FORWARDING / TRANSFER INSTRUCTIONS:\n"
+                f"- Trigger Condition: {condition}\n"
+                f"- Action: Politely say 'I will transfer you right away to our team specialist. Please hold the line for just a moment.', then forward the call to {request.forwarding_phone_number}."
+            )
+
+        if request.calendar_booking_enabled and request.calendar_url:
+            prompt_sections.append(
+                f"\n\n### APPOINTMENT / CALENDAR SCHEDULING:\n"
+                f"- When the customer wants to schedule or book an appointment, confirm their preferred day and time.\n"
+                f"- Meeting booking calendar URL: {request.calendar_url}"
+            )
+
+        compiled_system_prompt = "\n".join(prompt_sections)
+        greeting = request.first_message.strip() if request.first_message else None
+
+        node_data = {
+            "name": request.name.strip(),
+            "prompt": compiled_system_prompt,
+            "greeting": greeting,
+            "greeting_type": "text" if greeting else None,
+            "allow_interrupt": True,
+            "is_start": True,
+            "wait_for_user_response": False if greeting else True,
+            "first_message": greeting or "",
+            "system_prompt": compiled_system_prompt,
+            "raw_prompt": raw_prompt,
+            "language": request.language or "en-IN",
+            "voice": request.voice_id or "default",
+            "call_type": "outbound",
+            "call_forwarding_enabled": request.call_forwarding_enabled or False,
+            "forwarding_phone_number": request.forwarding_phone_number or "",
+            "forwarding_condition": request.forwarding_condition or "",
+            "calendar_booking_enabled": request.calendar_booking_enabled or False,
+            "calendar_url": request.calendar_url or "",
+        }
+
+        nodes = [
+            {
+                "id": "start_1",
+                "type": "startCall",
+                "position": {"x": 250, "y": 150},
+                "data": node_data,
+            }
+        ]
+        definition = {"nodes": nodes, "edges": []}
+
+        workflow.name = request.name.strip()
+        workflow.builtin_category = request.category or workflow.builtin_category or "Custom"
+        workflow.builtin_badge = request.badge or workflow.builtin_badge or "Custom Caller"
+        workflow.builtin_description = request.description or ""
+        workflow.builtin_variables = request.variables or []
+        workflow.builtin_conversion_goal = request.conversion_goal or {}
+        workflow.workflow_definition = definition
+
+        wf_def_row = WorkflowDefinitionModel(
+            workflow_id=workflow.id,
+            workflow_json=definition,
+            is_current=True,
+            status="published",
+            version_number=(workflow.released_definition.version_number + 1) if workflow.released_definition else 1,
+            published_at=datetime.now(),
+            workflow_configurations={},
+            template_context_variables={},
+        )
+        session.add(wf_def_row)
+        await session.flush()
+        workflow.released_definition_id = wf_def_row.id
+
+        formatted_result = _format_agent_item(workflow)
+        await session.commit()
+        return formatted_result
+
+
+@router.delete("/custom/{workflow_id}")
+async def delete_custom_agent(
+    workflow_id: int,
+    user: UserModel = Depends(get_user),
+):
+    """
+    Delete or archive a custom caller owned by the user's organization.
+    """
+    org_id = user.selected_organization_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="User must have an active organization selected")
+
+    async with db_client.async_session() as session:
+        stmt = select(WorkflowModel).where(
+            and_(
+                WorkflowModel.id == workflow_id,
+                WorkflowModel.organization_id == org_id,
+                WorkflowModel.is_builtin == False,
+            )
+        )
+        res = await session.execute(stmt)
+        workflow = res.scalar_one_or_none()
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Custom caller not found or permission denied")
+
+        workflow.status = WorkflowStatus.ARCHIVED.value
+        await session.commit()
+        return {"status": "success", "message": f"Caller '{workflow.name}' archived."}
 
 
 async def _seed_default_builtin_workflows(session):
