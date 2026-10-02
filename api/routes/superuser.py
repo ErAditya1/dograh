@@ -370,7 +370,10 @@ async def create_master_key(
 ):
     """Add a new platform master key."""
     if request.service_type not in ("llm", "stt", "tts"):
-        raise HTTPException(status_code=400, detail="Invalid service_type. Must be 'llm', 'stt', or 'tts'.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid service_type. Must be 'llm', 'stt', or 'tts'.",
+        )
 
     created = await db_client.create_master_key(
         service_type=request.service_type,

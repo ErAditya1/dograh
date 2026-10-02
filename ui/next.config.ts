@@ -6,6 +6,7 @@ const nextConfig: NextConfig = {
   output: 'standalone',
   experimental: {
     serverSourceMaps: true,
+    reactCompiler: process.env.NODE_ENV === "production" ? false : undefined,
   },
   async rewrites() {
     return [

@@ -1732,3 +1732,225 @@ class SubscriptionPlanModel(Base):
     )
 
 
+class OrganizationCalendarSettingsModel(Base):
+    __tablename__ = "organization_calendar_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    timezone = Column(
+        String(64),
+        nullable=False,
+        default="Asia/Kolkata",
+        server_default=text("'Asia/Kolkata'"),
+    )
+    weekly_schedule = Column(
+        JSON,
+        nullable=False,
+        default=lambda: {
+            "mon": ["10:00-19:00"],
+            "tue": ["10:00-19:00"],
+            "wed": ["10:00-19:00"],
+            "thu": ["10:00-19:00"],
+            "fri": ["10:00-19:00"],
+            "sat": ["10:00-17:00"],
+            "sun": [],
+        },
+        server_default=text(
+            '\'{"mon":["10:00-19:00"],"tue":["10:00-19:00"],"wed":["10:00-19:00"],"thu":["10:00-19:00"],"fri":["10:00-19:00"],"sat":["10:00-17:00"],"sun":[]}\'::json'
+        ),
+    )
+    slot_duration_mins = Column(
+        Integer, nullable=False, default=30, server_default=text("30")
+    )
+    buffer_mins = Column(
+        Integer, nullable=False, default=10, server_default=text("10")
+    )
+    max_advance_days = Column(
+        Integer, nullable=False, default=14, server_default=text("14")
+    )
+    meeting_title_template = Column(
+        String(255),
+        nullable=False,
+        default="Consultation with {lead_name}",
+        server_default=text("'Consultation with {lead_name}'"),
+    )
+    location_type = Column(
+        String(64),
+        nullable=False,
+        default="phone_call",
+        server_default=text("'phone_call'"),
+    )
+    static_meeting_url = Column(String(512), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    organization = relationship("OrganizationModel")
+
+
+class ScheduledAppointmentModel(Base):
+    __tablename__ = "scheduled_appointments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    campaign_id = Column(
+        Integer,
+        ForeignKey("campaigns.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    contact_id = Column(Integer, nullable=True, index=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    customer_name = Column(String(255), nullable=False)
+    customer_phone = Column(String(64), nullable=False, index=True)
+    customer_email = Column(String(255), nullable=True)
+
+    scheduled_start = Column(DateTime(timezone=True), nullable=False, index=True)
+    scheduled_end = Column(DateTime(timezone=True), nullable=False)
+    status = Column(
+        String(32),
+        nullable=False,
+        default="confirmed",
+        server_default=text("'confirmed'"),
+    )
+    notes = Column(Text, nullable=True)
+    meeting_link = Column(String(512), nullable=True)
+    ics_uid = Column(
+        String(128), unique=True, nullable=False, default=lambda: str(uuid.uuid4())
+    )
+
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    organization = relationship("OrganizationModel")
+    campaign = relationship("CampaignModel")
+    workflow_run = relationship("WorkflowRunModel")
+
+
+class CampaignFollowupConfigModel(Base):
+    __tablename__ = "campaign_followup_configs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    campaign_id = Column(
+        Integer,
+        ForeignKey("campaigns.id", ondelete="CASCADE"),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    is_auto_enabled = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    trigger_intents = Column(
+        JSON,
+        nullable=False,
+        default=lambda: ["interested", "appointment"],
+        server_default=text('\'["interested", "appointment"]\'::json'),
+    )
+    min_lead_score = Column(
+        Integer, nullable=False, default=60, server_default=text("60")
+    )
+    channels = Column(
+        JSON,
+        nullable=False,
+        default=lambda: {"whatsapp": True, "sms": True, "email": False},
+        server_default=text(
+            '\'{"whatsapp": true, "sms": true, "email": false}\'::json'
+        ),
+    )
+
+    whatsapp_template = Column(Text, nullable=True)
+    sms_template = Column(Text, nullable=True)
+    email_subject = Column(String(255), nullable=True)
+    email_body_template = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    campaign = relationship("CampaignModel")
+    organization = relationship("OrganizationModel")
+
+
+class LeadNotificationLogModel(Base):
+    __tablename__ = "lead_notifications_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    campaign_id = Column(
+        Integer,
+        ForeignKey("campaigns.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    contact_id = Column(Integer, nullable=True, index=True)
+    run_id = Column(
+        Integer,
+        ForeignKey("workflow_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    channel = Column(String(32), nullable=False, index=True)
+    recipient = Column(String(255), nullable=False)
+    content_sent = Column(Text, nullable=False)
+    status = Column(
+        String(32),
+        nullable=False,
+        default="sent",
+        server_default=text("'sent'"),
+    )
+    provider_message_id = Column(String(128), nullable=True)
+    error_reason = Column(Text, nullable=True)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        index=True,
+    )
+
+    organization = relationship("OrganizationModel")
+    campaign = relationship("CampaignModel")
+    workflow_run = relationship("WorkflowRunModel")
+
+
+

@@ -39,6 +39,8 @@ from api.routes.workflow import router as workflow_router
 from api.routes.workflow_embed import router as workflow_embed_router
 from api.routes.leads import router as leads_router
 from api.routes.contacts import router as contacts_router
+from api.routes.calendar import router as calendar_router
+from api.routes.followup import router as followup_router
 from api.routes.workflow_recording import router as workflow_recording_router
 from api.routes.workflow_text_chat import router as workflow_text_chat_router
 from api.services.integrations import all_routers
@@ -48,6 +50,8 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
+router.include_router(calendar_router)
+router.include_router(followup_router)
 router.include_router(leads_router)
 router.include_router(contacts_router)
 router.include_router(dashboard_router)
