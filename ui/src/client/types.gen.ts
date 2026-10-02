@@ -606,6 +606,8 @@ export type ByokPipelineAiModelConfiguration = {
     } & OpenAillmService) | ({
         provider: 'atlascloud';
     } & AtlasCloudLlmService) | ({
+        provider: 'hopper';
+    } & HopperLlmConfiguration) | ({
         provider: 'google_vertex';
     } & GoogleVertexLlmConfiguration) | ({
         provider: 'groq';
@@ -692,6 +694,8 @@ export type ByokPipelineAiModelConfiguration = {
     } & AssemblyAisttConfiguration) | ({
         provider: 'gladia';
     } & GladiaSttConfiguration) | ({
+        provider: 'soniox';
+    } & SonioxSttConfiguration) | ({
         provider: 'azure_speech';
     } & AzureSpeechSttConfiguration) | ({
         provider: 'smallest';
@@ -742,6 +746,8 @@ export type ByokRealtimeAiModelConfiguration = {
     } & OpenAillmService) | ({
         provider: 'atlascloud';
     } & AtlasCloudLlmService) | ({
+        provider: 'hopper';
+    } & HopperLlmConfiguration) | ({
         provider: 'google_vertex';
     } & GoogleVertexLlmConfiguration) | ({
         provider: 'groq';
@@ -2052,6 +2058,12 @@ export type DeepgramSttConfiguration = {
      */
     language?: string;
     /**
+     * Language Hints
+     *
+     * More languages to bias Flux multilingual toward, on top of the language above. Pick several when callers switch between known languages; leave empty to rely on the language above.
+     */
+    language_hints?: Array<string>;
+    /**
      * Base Url
      *
      * Deepgram API endpoint. This is what decides where call audio is processed: use https://api.eu.deepgram.com to keep processing inside the EU, or https://api.au.deepgram.com for Australia. The same API key works on every regional endpoint.
@@ -3342,6 +3354,28 @@ export type HealthResponse = {
 };
 
 /**
+ * Hopper
+ */
+export type HopperLlmConfiguration = {
+    /**
+     * Provider
+     */
+    provider?: 'hopper';
+    /**
+     * Api Key
+     *
+     * API key from your Hopper console.
+     */
+    api_key: string | Array<string>;
+    /**
+     * Model
+     *
+     * Hopper chat model.
+     */
+    model?: string;
+};
+
+/**
  * HttpApiConfig
  *
  * Configuration for HTTP API tools.
@@ -4597,6 +4631,12 @@ export type OpenRouterLlmConfiguration = {
      * Override only if proxying OpenRouter through your own gateway.
      */
     base_url?: string;
+    /**
+     * Provider Order
+     *
+     * OpenRouter provider slugs to try first, in order, one per entry (e.g. groq), as listed on the model's OpenRouter page. Pinning a low-latency provider avoids OpenRouter's default price-weighted routing; other providers are still used if these are unavailable.
+     */
+    provider_order?: Array<string>;
 };
 
 /**
@@ -5720,6 +5760,12 @@ export type SarvamLlmConfiguration = {
      */
     model?: string;
     /**
+     * Base Url
+     *
+     * Sarvam API base URL.
+     */
+    base_url?: string;
+    /**
      * Temperature
      *
      * Sampling temperature. Sarvam recommends 0.5 for balanced conversational responses.
@@ -5985,6 +6031,32 @@ export type SmallestAittsConfiguration = {
      * Speech speed multiplier (0.5 to 2.0).
      */
     speed?: number;
+};
+
+/**
+ * Soniox
+ */
+export type SonioxSttConfiguration = {
+    /**
+     * Provider
+     */
+    provider?: 'soniox';
+    /**
+     * Api Key
+     */
+    api_key: string | Array<string>;
+    /**
+     * Model
+     *
+     * Soniox real-time STT model.
+     */
+    model?: string;
+    /**
+     * Language
+     *
+     * ISO 639-1 language code, sent as a language hint. 'multi' sends no hint and lets Soniox auto-detect the language.
+     */
+    language?: string;
 };
 
 /**
@@ -7136,6 +7208,18 @@ export type TransferAgentToolDefinition = {
  * Configuration for Transfer Call tools.
  */
 export type TransferCallConfig = {
+    /**
+     * Introduction Enabled
+     *
+     * Play a generated introduction in the agent's voice to both parties before connecting them. Supported for Twilio calls with a TTS provider. Realtime speech-to-speech agents and synthesis failures skip the introduction.
+     */
+    introduction_enabled?: boolean;
+    /**
+     * Introduction Prompt
+     *
+     * Instructions for the transfer introduction, including language.
+     */
+    introduction_prompt?: string;
     /**
      * Destination Source
      *
@@ -14220,6 +14304,30 @@ export type GetBillingCreditsApiV1OrganizationsBillingCreditsGetData = {
          * Limit
          */
         limit?: number;
+        /**
+         * Entry Type
+         *
+         * Entry type; credit includes purchases, grants, and additional credits
+         */
+        entry_type?: 'credit' | 'purchase' | 'debit' | 'grant' | 'additional_credit' | null;
+        /**
+         * Start Date
+         *
+         * Inclusive calendar date in timezone
+         */
+        start_date?: string | null;
+        /**
+         * End Date
+         *
+         * Inclusive calendar date in timezone
+         */
+        end_date?: string | null;
+        /**
+         * Timezone
+         *
+         * IANA timezone for the selected calendar dates
+         */
+        timezone?: string;
     };
     url: '/api/v1/organizations/billing/credits';
 };

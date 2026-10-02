@@ -178,7 +178,17 @@ def register_event_handlers(
             # pipeline nothing can generate until this lands: an agent worker
             # is inactive until told otherwise, and an inactive worker is
             # handed no frames from the bus.
-            if not await engine.start_initial_agent():
+            # Disposal precedes retirement, so avoid startup once shutdown begins.
+            if engine.is_call_disposed():
+                return
+
+            started = await engine.start_initial_agent()
+
+            # Hangup during startup must skip both opening and failure handling.
+            if engine.is_call_disposed():
+                return
+
+            if not started:
                 logger.error(
                     f"Initial agent never became ready for run {workflow_run_id}; "
                     "ending the call"
@@ -189,6 +199,8 @@ def register_event_handlers(
             # Set the start node now (after pre-call fetch data is merged)
             # so that render_template() has the complete _call_context_vars.
             await engine.set_node(engine.active_agent.workflow.start_node_id)
+            if engine.is_call_disposed():
+                return
             if answer_supervisor is not None:
                 await engine.handle_answer_supervision()
                 return
@@ -210,7 +222,7 @@ def register_event_handlers(
     async def on_client_disconnected(_transport, _participant):
         call_disposed = engine.is_call_disposed()
 
-        logger.debug(
+        logger.info(
             f"In on_client_disconnected callback handler. Call disposed: {call_disposed}"
         )
 
@@ -446,7 +458,7 @@ def register_event_handlers(
             except Exception as e:
                 logger.error(f"Error saving realtime feedback logs: {e}", exc_info=True)
         else:
-            logger.debug("Logs buffer is empty, skipping save")
+            logger.info("Logs buffer is empty, skipping save")
 
         logs_update.update(integration_logs)
 
@@ -477,23 +489,23 @@ def register_event_handlers(
                 if not in_memory_audio_buffers.mixed.is_empty:
                     mixed_audio_wav = await in_memory_audio_buffers.mixed.to_wav_bytes()
                 else:
-                    logger.debug("Audio buffer is empty, skipping upload")
+                    logger.info("Audio buffer is empty, skipping upload")
 
                 if not in_memory_audio_buffers.user.is_empty:
                     user_audio_wav = await in_memory_audio_buffers.user.to_wav_bytes()
                 else:
-                    logger.debug("User audio buffer is empty, skipping upload")
+                    logger.info("User audio buffer is empty, skipping upload")
 
                 if not in_memory_audio_buffers.bot.is_empty:
                     bot_audio_wav = await in_memory_audio_buffers.bot.to_wav_bytes()
                 else:
-                    logger.debug("Bot audio buffer is empty, skipping upload")
+                    logger.info("Bot audio buffer is empty, skipping upload")
 
             transcript_text = in_memory_logs_buffer.generate_transcript_text(
                 include_end_timestamps=include_transcript_end_timestamps
             )
             if not transcript_text:
-                logger.debug("No transcript events in logs buffer, skipping upload")
+                logger.info("No transcript events in logs buffer, skipping upload")
 
             await upload_workflow_run_artifacts(
                 workflow_run_id,

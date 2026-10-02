@@ -245,7 +245,14 @@ class PipecatEngine:
             max_duration_end_task_callback=self.create_max_duration_callback(),
         )
         self.speech_playback.add_observer(self.call_monitor)
-        self.greeting = GreetingController(self.speech_playback, lambda: self.context)
+        self.greeting = GreetingController(
+            self.speech_playback,
+            lambda: self.context,
+            is_screening=lambda: (
+                self.answer_supervisor is not None
+                and self.answer_supervisor.awaiting_screening_pickup
+            ),
+        )
 
         # Tracks whether the bot is currently speaking (for allow_interrupt logic)
         self._bot_is_speaking: bool = False
@@ -883,7 +890,7 @@ class PipecatEngine:
 
         node = self.active_agent.workflow.nodes[node_id]
 
-        logger.debug(
+        logger.info(
             f"Executing node: name: {node.name} allow_interrupt: {node.allow_interrupt} is_end: {node.is_end}"
         )
 
@@ -1050,7 +1057,7 @@ class PipecatEngine:
                     and self._fetch_recording_audio
                     and self._transport_output is not None
                 ):
-                    logger.debug(f"Playing audio greeting recording: {greeting_value}")
+                    logger.info(f"Playing audio greeting recording: {greeting_value}")
                     fetch_kwargs = (
                         {"recording_id": greeting_value}
                         if greeting_type == "audio_recording_id"
@@ -1073,7 +1080,7 @@ class PipecatEngine:
                         "falling back to LLM generation"
                     )
                 elif greeting_value and agent.worker is not None:
-                    logger.debug("Playing text greeting via TTS")
+                    logger.info("Playing text greeting via TTS")
                     # Completed greeting playback is retained in context so
                     # the LLM knows the caller has already been greeted.
                     if self._is_realtime:
@@ -1212,7 +1219,7 @@ class PipecatEngine:
         ):
             return
 
-        logger.debug(
+        logger.info(
             f"Refining call disposition: {fallback_disposition} -> "
             f"{extracted_disposition}"
         )
@@ -1390,7 +1397,7 @@ class PipecatEngine:
         # write, of the finished context, is enough. Hangup strategies read
         # only keys recorded at call setup or at transfer time, never the
         # terminal extraction.
-        logger.debug(
+        logger.info(
             f"Finishing run with call status: {call_status}, disposition: "
             f"{self._gathered_context.get(CALL_DISPOSITION_CONTEXT_KEY, call_disposition)} "
             f"queueing frame {frame_to_push}"
@@ -1662,7 +1669,7 @@ class PipecatEngine:
 
     @property
     def transfer_in_progress(self) -> bool:
-        """Whether a handoff is running, so ordinary prompting must hold off."""
+        """Whether a handoff is running, including the destination's opening."""
         coordinator = self.__dict__.get("_transfer_coordinator")
         return coordinator is not None and coordinator.in_progress
 
@@ -1698,6 +1705,8 @@ class PipecatEngine:
             return False
 
         await self._agent_factory.attach(agent)
+        if agent.worker is None or agent.retired:
+            return False
         if not await agent.wait_until_started(timeout=timeout):
             return False
         return await self.activate_agent(agent, timeout=timeout)
@@ -1725,10 +1734,11 @@ class PipecatEngine:
 
     def commit_agent(self, runtime: AgentRuntime, snapshot) -> None:
         """The only handoff commit point. No awaits and no provider work."""
-        from api.services.workflow.agent_handoff_context import messages_after_boundary
+        from api.services.workflow.agent_handoff_context import (
+            complete_handoff_message,
+        )
 
-        tail = messages_after_boundary(self.context, snapshot.boundary)
-        self.context.set_messages([*snapshot.messages, *tail])
+        self.context.set_messages([complete_handoff_message(self.context, snapshot)])
         self.context.set_tools(runtime.tools)
         self.context.set_otel_span_name(f"llm-{runtime.current_node.name}")
         runtime.entered_at = time.time()
@@ -1740,8 +1750,7 @@ class PipecatEngine:
             nodes.append(runtime.current_node.name)
         logger.info(
             f"[transfer] installed {runtime.visit_id}: "
-            f"{len(snapshot.messages)} handoff messages (summarized={snapshot.summarized}) "
-            f"+ {len(tail)} live messages"
+            "conversation handed over as one transcript message"
         )
 
     async def notify_agent_entered(self, runtime: AgentRuntime) -> None:
@@ -1760,6 +1769,19 @@ class PipecatEngine:
 
     def agent_can_act(self, runtime: AgentRuntime) -> bool:
         return not self._call_disposed and self.selected_visit_id == runtime.visit_id
+
+    def agent_can_generate(self, runtime: AgentRuntime) -> bool:
+        """Allow the selected agent's turns once a handoff reaches its opening.
+
+        The handoff still owns its request until the opening has been queued,
+        but tool results during that opening must be able to run the LLM again.
+        """
+        from api.services.workflow.agent_transfer import TransferPhase
+
+        coordinator = self._transfer_coordinator
+        return self.agent_can_act(runtime) and (
+            not self.transfer_in_progress or coordinator.phase is TransferPhase.OPENING
+        )
 
     def install_agent(
         self,
@@ -1811,7 +1833,7 @@ class PipecatEngine:
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
             if runtime.worker.active:
-                logger.debug(f"Agent visit {runtime.visit_id} activated")
+                logger.info(f"Agent visit {runtime.visit_id} activated")
                 return True
             await asyncio.sleep(0.01)
         logger.warning(
@@ -1930,18 +1952,10 @@ class PipecatEngine:
     def _conversation_enabled(self) -> bool:
         return self.agent_can_act(self.active_agent) and not self.transfer_in_progress
 
-    def _response_watch_enabled(self, runtime: AgentRuntime) -> bool:
-        from api.services.workflow.agent_transfer import TransferPhase
-
-        coordinator = self._transfer_coordinator
-        return self.agent_can_act(runtime) and (
-            not self.transfer_in_progress or coordinator.phase is TransferPhase.OPENING
-        )
-
     def _bind_call_monitor(self, runtime: AgentRuntime) -> None:
         self.speech_playback.observe_responses(runtime.llm)
         self.call_monitor.bind_source(
-            runtime.llm, enabled=lambda: self._response_watch_enabled(runtime)
+            runtime.llm, enabled=lambda: self.agent_can_generate(runtime)
         )
 
     def expect_response(self) -> None:
@@ -1955,7 +1969,7 @@ class PipecatEngine:
             # An interruption or handoff can win the race with this task.
             if (
                 source is not self.active_agent.llm
-                or not self._response_watch_enabled(self.active_agent)
+                or not self.agent_can_generate(self.active_agent)
                 or not self.call_monitor.response_timed_out(source)
             ):
                 return
