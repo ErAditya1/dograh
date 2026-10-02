@@ -475,7 +475,10 @@ async def create_workflow(
     """
     # Check SaaS plan agent count limit
     from api.services.plan_service import plan_service
-    can_create, err_msg = await plan_service.validate_can_create_workflow(user.selected_organization_id)
+    can_create, err_msg = await plan_service.validate_can_create_workflow(
+        user.selected_organization_id,
+        is_superuser=getattr(user, "is_superuser", False),
+    )
     if not can_create:
         raise HTTPException(status_code=403, detail=err_msg)
 
@@ -605,7 +608,10 @@ async def create_workflow_from_template(
     try:
         # Check SaaS plan agent count limit
         from api.services.plan_service import plan_service
-        can_create, err_msg = await plan_service.validate_can_create_workflow(user.selected_organization_id)
+        can_create, err_msg = await plan_service.validate_can_create_workflow(
+            user.selected_organization_id,
+            is_superuser=getattr(user, "is_superuser", False),
+        )
         if not can_create:
             raise HTTPException(status_code=403, detail=err_msg)
 
@@ -1414,7 +1420,10 @@ async def duplicate_workflow_endpoint(
     try:
         # Check SaaS plan agent count limit
         from api.services.plan_service import plan_service
-        can_create, err_msg = await plan_service.validate_can_create_workflow(user.selected_organization_id)
+        can_create, err_msg = await plan_service.validate_can_create_workflow(
+            user.selected_organization_id,
+            is_superuser=getattr(user, "is_superuser", False),
+        )
         if not can_create:
             raise HTTPException(status_code=403, detail=err_msg)
 

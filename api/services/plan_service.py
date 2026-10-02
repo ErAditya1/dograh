@@ -69,7 +69,7 @@ DEFAULT_PAY_AS_YOU_GO = {
     "monthly_credits_usd": 0.0,
     "included_phone_numbers": 0,
     "max_concurrent_calls": 2,
-    "max_agents": 2,
+    "max_agents": 5,
     "overage_rate_per_minute_usd": 0.10,
     "byok_platform_fee_per_minute_usd": 0.05,
     "allow_byok": True,
@@ -132,6 +132,7 @@ class PlanService:
                 "ALTER TABLE organizations ALTER COLUMN wallet_balance_usd SET DEFAULT 0.0",
                 "UPDATE organizations SET wallet_balance_usd = 0.0 WHERE subscription_tier = 'simple_trial' AND wallet_balance_usd = 10.0",
                 "UPDATE organizations SET subscription_tier = 'simple_trial', wallet_balance_usd = 0.0 WHERE subscription_tier = 'pay_as_you_go' AND wallet_balance_usd = 10.0 AND (monthly_minutes_used = 0.0 OR monthly_minutes_used IS NULL)",
+                "UPDATE subscription_plans SET max_agents = 5 WHERE max_agents < 5",
                 "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(32) DEFAULT 'active'",
                 "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_cycle_start TIMESTAMPTZ",
                 "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_cycle_end TIMESTAMPTZ",
@@ -263,7 +264,7 @@ class PlanService:
                     "monthly_credits_usd": 0.0,
                     "included_phone_numbers": 0,
                     "max_concurrent_calls": 1,
-                    "max_agents": 1,
+                    "max_agents": 5,
                     "overage_rate_per_minute_usd": 0.10,
                     "byok_platform_fee_per_minute_usd": 0.04,
                     "allow_byok": True,
@@ -273,7 +274,7 @@ class PlanService:
                     "is_public": True,
                     "features": [
                         "15 Free Calling Minutes Included",
-                        "1 Active AI Voice Agent",
+                        "Up to 5 AI Voice Agents",
                         "1 Simultaneous Call Line",
                         "WebRTC In-Browser Voice Testing",
                         "Instant Setup, No Credit Card Required",
@@ -471,8 +472,8 @@ class PlanService:
                 tier="simple_trial",
                 tier_name="Free Trial",
                 subscription_status="active",
-                max_concurrent_calls=1,
-                max_agents=1,
+                max_concurrent_calls=2,
+                max_agents=5,
                 included_minutes=15,
                 monthly_minutes_used=0.0,
                 minutes_remaining=15.0,
@@ -495,7 +496,7 @@ class PlanService:
         # Plan base values or fallback
         base_name = plan.name if plan else tier_slug.replace("_", " ").title()
         base_concurrency = plan.max_concurrent_calls if plan else 2
-        base_agents = plan.max_agents if plan else 2
+        base_agents = plan.max_agents if plan else 5
         base_minutes = plan.included_minutes if plan else (15 if tier_slug in ("pay_as_you_go", "simple_trial") else 0)
         if base_minutes == 0 and tier_slug in ("pay_as_you_go", "simple_trial"):
             base_minutes = 15
@@ -615,8 +616,15 @@ class PlanService:
             custom_monthly_price_usd=custom_price,
         )
 
-    async def validate_can_create_workflow(self, organization_id: int) -> tuple[bool, str]:
+    async def validate_can_create_workflow(
+        self, organization_id: Optional[int], is_superuser: bool = False
+    ) -> tuple[bool, str]:
         """Validate if the organization has capacity to create another AI Agent workflow."""
+        if is_superuser:
+            return True, ""
+        if not organization_id:
+            return True, ""
+
         limits = await self.get_effective_limits(organization_id)
         current_count = await db_client.get_workflow_count(organization_id)
 
