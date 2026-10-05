@@ -75,6 +75,9 @@ class InitiateCallRequest(BaseModel):
     voice: str | None = None
     voice_id: str | None = None
     tts_provider: str | None = None
+    call_forwarding_enabled: bool | None = None
+    forwarding_phone_number: str | None = None
+    forwarding_condition: str | None = None
 
 
 async def _get_execution_user_id(workflow, fallback_user_id: int | None = None) -> int:
@@ -240,6 +243,13 @@ async def initiate_call(
                 init_ctx["voice_id"] = request.voice_id
             if request.tts_provider:
                 init_ctx["tts_provider"] = request.tts_provider
+            if request.call_forwarding_enabled is not None:
+                init_ctx["call_forwarding_enabled"] = request.call_forwarding_enabled
+            if request.forwarding_phone_number:
+                init_ctx["forwarding_phone_number"] = request.forwarding_phone_number
+                init_ctx["transfer_destination"] = request.forwarding_phone_number
+            if request.forwarding_condition:
+                init_ctx["forwarding_condition"] = request.forwarding_condition
             run_inputs = await prepare_workflow_run_inputs(
                 db_client,
                 workflow,

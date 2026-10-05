@@ -277,6 +277,9 @@ class CreateCampaignRequest(BaseModel):
     contact_ids: Optional[List[int]] = None
     group_id: Optional[int] = None
     group_ids: Optional[List[int]] = None
+    call_forwarding_enabled: Optional[bool] = None
+    forwarding_phone_number: Optional[str] = None
+    forwarding_condition: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_agent_selection(self):
@@ -762,6 +765,12 @@ async def create_campaign(
         orchestrator_metadata["tts_provider"] = request.tts_provider
     if request.record_calls is not None:
         orchestrator_metadata["record_calls"] = request.record_calls
+    if request.call_forwarding_enabled is not None:
+        orchestrator_metadata["call_forwarding_enabled"] = request.call_forwarding_enabled
+    if request.forwarding_phone_number:
+        orchestrator_metadata["forwarding_phone_number"] = request.forwarding_phone_number
+    if request.forwarding_condition:
+        orchestrator_metadata["forwarding_condition"] = request.forwarding_condition
 
     campaign = await db_client.create_campaign(
         name=request.name,
@@ -989,6 +998,9 @@ class TestCallRequest(BaseModel):
     voice: Optional[str] = None
     voice_id: Optional[str] = None
     tts_provider: Optional[str] = None
+    call_forwarding_enabled: Optional[bool] = None
+    forwarding_phone_number: Optional[str] = None
+    forwarding_condition: Optional[str] = None
 
 
 @router.post("/test-call")
@@ -1069,6 +1081,9 @@ async def trigger_test_call(
                 voice=request.voice,
                 voice_id=request.voice_id,
                 tts_provider=request.tts_provider,
+                call_forwarding_enabled=request.call_forwarding_enabled,
+                forwarding_phone_number=request.forwarding_phone_number,
+                forwarding_condition=request.forwarding_condition,
             )
             res = await initiate_call(call_req, user=user)
             return {

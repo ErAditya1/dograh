@@ -256,6 +256,15 @@ class CampaignCallDispatcher:
                     initial_context["voice_id"] = campaign.orchestrator_metadata["voice_id"]
                 if campaign.orchestrator_metadata.get("tts_provider"):
                     initial_context["tts_provider"] = campaign.orchestrator_metadata["tts_provider"]
+                if campaign.orchestrator_metadata.get("call_forwarding_enabled") is not None:
+                    initial_context["call_forwarding_enabled"] = campaign.orchestrator_metadata["call_forwarding_enabled"]
+                if campaign.orchestrator_metadata.get("forwarding_phone_number"):
+                    initial_context["forwarding_phone_number"] = campaign.orchestrator_metadata["forwarding_phone_number"]
+                    initial_context["transfer_destination"] = campaign.orchestrator_metadata["forwarding_phone_number"]
+                if campaign.orchestrator_metadata.get("forwarding_condition"):
+                    initial_context["forwarding_condition"] = campaign.orchestrator_metadata["forwarding_condition"]
+                if campaign.orchestrator_metadata.get("instructions"):
+                    initial_context["campaign_instructions"] = campaign.orchestrator_metadata["instructions"]
             run_inputs = await prepare_workflow_run_inputs(
                 db_client, workflow, definition_id=variant["workflow_definition_id"]
             )

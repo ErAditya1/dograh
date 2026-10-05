@@ -559,6 +559,21 @@ PROVIDER_SUPPORTED_LANGUAGES: dict[str, list[dict]] = {
         {"code": "it", "name": "Italian", "flag": "🇮🇹"},
         {"code": "pt-BR", "name": "Portuguese (Brazil)", "flag": "🇧🇷"},
     ],
+    "google": [
+        {"code": "en-US", "name": "US English", "flag": "🇺🇸"},
+        {"code": "en-IN", "name": "Indian English", "flag": "🇮🇳"},
+        {"code": "hi-IN", "name": "Hindi", "flag": "🇮🇳"},
+        {"code": "es-ES", "name": "Spanish", "flag": "🇪🇸"},
+        {"code": "fr-FR", "name": "French", "flag": "🇫🇷"},
+        {"code": "de-DE", "name": "German", "flag": "🇩🇪"},
+        {"code": "ja-JP", "name": "Japanese", "flag": "🇯🇵"},
+    ],
+    "rime": [
+        {"code": "en", "name": "English", "flag": "🇺🇸"},
+    ],
+    "lmnt": [
+        {"code": "en", "name": "English", "flag": "🇺🇸"},
+    ],
 }
 
 
@@ -620,16 +635,33 @@ async def get_default_voices(
         logger.debug("Could not resolve default platform TTS provider: {}", e)
         admin_provider = DEFAULT_SERVICE_PROVIDERS.get("tts", "cartesia").lower()
 
-    return await get_voices(
-        provider=admin_provider,
-        model=admin_model,
-        language=language,
-        q=q,
-        gender=gender,
-        accent=accent,
-        refresh=refresh,
-        user=user,
-    )
+    try:
+        return await get_voices(
+            provider=admin_provider,
+            model=admin_model,
+            language=language,
+            q=q,
+            gender=gender,
+            accent=accent,
+            refresh=refresh,
+            user=user,
+        )
+    except Exception as exc:
+        if admin_provider != "cartesia":
+            logger.warning(
+                f"Default TTS provider {admin_provider} voices failed ({exc}). Falling back to cartesia."
+            )
+            return await get_voices(
+                provider="cartesia",
+                model=None,
+                language=language,
+                q=q,
+                gender=gender,
+                accent=accent,
+                refresh=refresh,
+                user=user,
+            )
+        raise
 
 
 @router.get("/configurations/voices/{provider}")
@@ -648,9 +680,24 @@ async def get_voices(
     with Redis caching.
     """
     normalized_provider = str(provider).lower()
+    if normalized_provider == "default":
+        try:
+            from api.services.platform_keys import get_default_platform_provider_and_model
+            default_result = get_default_platform_provider_and_model("tts")
+            if default_result and default_result[0]:
+                normalized_provider = default_result[0].lower()
+                if not model and default_result[2]:
+                    model = default_result[2]
+            else:
+                admin_prov = DEFAULT_SERVICE_PROVIDERS.get("tts", "cartesia")
+                normalized_provider = admin_prov.lower() if isinstance(admin_prov, str) else "cartesia"
+        except Exception:
+            admin_prov = DEFAULT_SERVICE_PROVIDERS.get("tts", "cartesia")
+            normalized_provider = admin_prov.lower() if isinstance(admin_prov, str) else "cartesia"
 
-    # Build unique Redis cache key
-    cache_key_elements = f"{normalized_provider}:{model or ''}:{language or ''}:{q or ''}:{gender or ''}:{accent or ''}"
+    # Build unique Redis cache key (scoped by organization for BYOK isolation)
+    org_scope = f"org_{user.selected_organization_id}" if user and user.selected_organization_id else "global"
+    cache_key_elements = f"{normalized_provider}:{org_scope}:{model or ''}:{language or ''}:{q or ''}:{gender or ''}:{accent or ''}"
     cache_key_hash = hashlib.md5(cache_key_elements.encode("utf-8")).hexdigest()
     redis_cache_key = f"voices:cache:{normalized_provider}:{cache_key_hash}"
 
@@ -664,28 +711,67 @@ async def get_voices(
         except Exception as e:
             logger.warning("Redis voice cache read error: {}", e)
 
-    # Fetch dynamically from MPS voice proxy URL (https://services.dograh.com/api/v1/voice-proxy/{provider}/voices)
-    result = await mps_service_key_client.get_voices(
-        provider=normalized_provider,
-        model=model,
-        language=language,
-        q=q,
-        gender=gender,
-        accent=accent,
-        organization_id=user.selected_organization_id if user else None,
-        created_by=user.provider_id if user else None,
-    )
-
     raw_voices = []
     facets_data = None
     resolved_provider = normalized_provider
+    key_source = "none"
 
-    if isinstance(result, dict):
-        resolved_provider = result.get("provider", normalized_provider)
-        raw_voices = result.get("voices", [])
-        facets_data = result.get("facets")
-    elif isinstance(result, list):
-        raw_voices = result
+    # 1. Fetch directly from Provider API using BYOK or Platform Master Key (Zero MPS dependency)
+    try:
+        from api.services.voice_catalog_service import get_direct_provider_voices
+        raw_voices, key_source = await get_direct_provider_voices(
+            provider=normalized_provider,
+            organization_id=user.selected_organization_id if user else None,
+        )
+        logger.info(
+            "Direct voice catalog for provider {} resolved {} voices (source={})",
+            normalized_provider,
+            len(raw_voices),
+            key_source,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Direct voice provider fetch failed for {}: {}. Attempting fallback.",
+            normalized_provider,
+            exc,
+        )
+
+    # 2. Fallback to MPS if direct voices list was empty and MPS is reachable
+    if not raw_voices:
+        try:
+            result = await mps_service_key_client.get_voices(
+                provider=normalized_provider,
+                model=model,
+                language=language,
+                q=q,
+                gender=gender,
+                accent=accent,
+                organization_id=user.selected_organization_id if user else None,
+                created_by=user.provider_id if user else None,
+            )
+            if isinstance(result, dict):
+                resolved_provider = result.get("provider", normalized_provider)
+                raw_voices = result.get("voices", [])
+                facets_data = result.get("facets")
+            elif isinstance(result, list):
+                raw_voices = result
+        except Exception as mps_exc:
+            logger.warning("MPS fallback unavailable: {}. Using offline voice catalog.", mps_exc)
+            from api.services.voice_catalog_service import (
+                get_cartesia_builtin_catalog,
+                get_elevenlabs_builtin_catalog,
+                get_sarvam_builtin_catalog,
+                get_deepgram_builtin_catalog,
+                get_openai_builtin_catalog,
+            )
+            builtins = {
+                "cartesia": get_cartesia_builtin_catalog,
+                "elevenlabs": get_elevenlabs_builtin_catalog,
+                "sarvam": get_sarvam_builtin_catalog,
+                "deepgram": get_deepgram_builtin_catalog,
+                "openai": get_openai_builtin_catalog,
+            }
+            raw_voices = builtins.get(normalized_provider, get_cartesia_builtin_catalog)()
 
     # Normalize voice items dynamically
     parsed_voices: list[VoiceInfo] = []
