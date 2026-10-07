@@ -898,6 +898,10 @@ async def save_subscription_plan_admin(
             plan = SubscriptionPlanModel(slug=request.slug)
             session.add(plan)
 
+        # If price changed, reset razorpay_plan_id so next checkout automatically generates a new Razorpay plan with updated price
+        if plan.price_usd != request.price_usd or (request.price_inr is not None and plan.price_inr != request.price_inr):
+            plan.razorpay_plan_id = None
+
         plan.name = request.name
         plan.description = request.description
         plan.price_usd = request.price_usd

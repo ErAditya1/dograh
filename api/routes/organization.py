@@ -2276,7 +2276,10 @@ async def upgrade_my_organization_plan(
         # Calculate INR amount with GST
         usd_rate = get_usd_to_inr_rate()
         gst = get_gst_percentage()
-        subtotal_inr = round(plan.price_usd * usd_rate, 2)
+        if getattr(plan, "price_inr", 0.0) and float(plan.price_inr) > 0:
+            subtotal_inr = round(float(plan.price_inr), 2)
+        else:
+            subtotal_inr = round(plan.price_usd * usd_rate, 2)
         gst_amount_inr = round(subtotal_inr * (gst / 100.0), 2)
         total_inr = round(subtotal_inr + gst_amount_inr, 2)
         amount_paise = int(round(total_inr * 100))
