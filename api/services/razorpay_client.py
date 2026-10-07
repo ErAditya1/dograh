@@ -2,7 +2,7 @@ import base64
 import hashlib
 import hmac
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from loguru import logger
@@ -94,6 +94,144 @@ class RazorpayService:
                 )
                 return resp_data
 
+    async def create_plan(
+        self,
+        name: str,
+        amount_paise: int,
+        currency: str = "INR",
+        period: str = "monthly",
+        interval: int = 1,
+        description: Optional[str] = None,
+        notes: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create a recurring plan in Razorpay for subscriptions."""
+        payload = {
+            "period": period,
+            "interval": interval,
+            "item": {
+                "name": name,
+                "amount": amount_paise,
+                "currency": currency,
+                "description": description or f"{name} ({period})",
+            },
+            "notes": notes or {},
+        }
+        url = f"{RAZORPAY_API_BASE}/plans"
+        headers = self._get_auth_header()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as response:
+                resp_data = await response.json()
+                if response.status not in (200, 201):
+                    logger.error(f"[Razorpay] Plan creation failed HTTP {response.status}: {resp_data}")
+                    error_msg = resp_data.get("error", {}).get("description", "Failed to create Razorpay plan")
+                    raise RuntimeError(f"Razorpay error: {error_msg}")
+                logger.info(f"[Razorpay] Created plan {resp_data.get('id')} for {name} ({amount_paise} paise)")
+                return resp_data
+
+    async def create_subscription(
+        self,
+        plan_id: str,
+        total_count: int = 120,
+        quantity: int = 1,
+        customer_notify: int = 1,
+        notes: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create a recurring subscription (e-Mandate) in Razorpay."""
+        payload = {
+            "plan_id": plan_id,
+            "total_count": total_count,
+            "quantity": quantity,
+            "customer_notify": customer_notify,
+            "notes": notes or {},
+        }
+        url = f"{RAZORPAY_API_BASE}/subscriptions"
+        headers = self._get_auth_header()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as response:
+                resp_data = await response.json()
+                if response.status not in (200, 201):
+                    logger.error(f"[Razorpay] Subscription creation failed HTTP {response.status}: {resp_data}")
+                    error_msg = resp_data.get("error", {}).get("description", "Failed to create Razorpay subscription")
+                    raise RuntimeError(f"Razorpay error: {error_msg}")
+                logger.info(f"[Razorpay] Created subscription {resp_data.get('id')} with plan {plan_id}")
+                return resp_data
+
+    async def get_subscription(self, subscription_id: str) -> Dict[str, Any]:
+        """Fetch subscription details from Razorpay."""
+        url = f"{RAZORPAY_API_BASE}/subscriptions/{subscription_id}"
+        headers = self._get_auth_header()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                resp_data = await response.json()
+                if response.status != 200:
+                    logger.error(f"[Razorpay] Get subscription failed HTTP {response.status}: {resp_data}")
+                    raise RuntimeError(f"Razorpay error: {resp_data}")
+                return resp_data
+
+    async def get_subscription_invoices(self, subscription_id: str) -> List[Dict[str, Any]]:
+        """Fetch all invoices belonging to a subscription from Razorpay."""
+        url = f"{RAZORPAY_API_BASE}/invoices?subscription_id={subscription_id}"
+        headers = self._get_auth_header()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    return []
+                resp_data = await response.json()
+                return resp_data.get("items", [])
+
+    async def get_order(self, order_id: str) -> Dict[str, Any]:
+        """Fetch order details from Razorpay."""
+        url = f"{RAZORPAY_API_BASE}/orders/{order_id}"
+        headers = self._get_auth_header()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                resp_data = await response.json()
+                if response.status != 200:
+                    logger.error(f"[Razorpay] Get order failed HTTP {response.status}: {resp_data}")
+                    raise RuntimeError(f"Razorpay error: {resp_data}")
+                return resp_data
+
+    async def get_payment(self, payment_id: str) -> Dict[str, Any]:
+        """Fetch payment details from Razorpay."""
+        url = f"{RAZORPAY_API_BASE}/payments/{payment_id}"
+        headers = self._get_auth_header()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                resp_data = await response.json()
+                if response.status != 200:
+                    logger.error(f"[Razorpay] Get payment failed HTTP {response.status}: {resp_data}")
+                    raise RuntimeError(f"Razorpay error: {resp_data}")
+                return resp_data
+
+
+    async def cancel_subscription(
+        self,
+        subscription_id: str,
+        cancel_at_cycle_end: bool = True,
+    ) -> Dict[str, Any]:
+        """Cancel an active Razorpay subscription."""
+        payload = {
+            "cancel_at_cycle_end": 1 if cancel_at_cycle_end else 0,
+        }
+        url = f"{RAZORPAY_API_BASE}/subscriptions/{subscription_id}/cancel"
+        headers = self._get_auth_header()
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers) as response:
+                resp_data = await response.json()
+                if response.status not in (200, 201):
+                    logger.error(f"[Razorpay] Cancel subscription failed HTTP {response.status}: {resp_data}")
+                    error_msg = resp_data.get("error", {}).get("description", "Failed to cancel Razorpay subscription")
+                    raise RuntimeError(f"Razorpay error: {error_msg}")
+                logger.info(f"[Razorpay] Cancelled subscription {subscription_id}")
+                return resp_data
+
     def verify_payment_signature(
         self,
         order_id: str,
@@ -108,6 +246,27 @@ class RazorpayService:
             return False
 
         message = f"{order_id}|{payment_id}".encode("utf-8")
+        secret_bytes = self.key_secret.encode("utf-8")
+        generated_signature = hmac.new(
+            secret_bytes, message, hashlib.sha256
+        ).hexdigest()
+
+        return hmac.compare_digest(generated_signature, signature)
+
+    def verify_subscription_signature(
+        self,
+        subscription_id: str,
+        payment_id: str,
+        signature: str,
+    ) -> bool:
+        """Verify Razorpay recurring subscription e-Mandate signature using HMAC SHA256.
+
+        Signature string format: payment_id + "|" + subscription_id
+        """
+        if not signature or not subscription_id or not payment_id:
+            return False
+
+        message = f"{payment_id}|{subscription_id}".encode("utf-8")
         secret_bytes = self.key_secret.encode("utf-8")
         generated_signature = hmac.new(
             secret_bytes, message, hashlib.sha256

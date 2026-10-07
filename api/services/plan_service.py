@@ -150,10 +150,29 @@ class PlanService:
                 "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS custom_byok_platform_fee_usd FLOAT",
                 "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS custom_allow_live_transfer BOOLEAN",
                 "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS custom_allow_sip_trunking BOOLEAN",
+                "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS razorpay_subscription_id VARCHAR(64)",
+                "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS subscription_payment_method VARCHAR(32)",
+                "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS subscription_cancel_at_period_end BOOLEAN DEFAULT false",
+                "ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS razorpay_plan_id VARCHAR(64)",
+                "ALTER TABLE payment_transactions ADD COLUMN IF NOT EXISTS razorpay_subscription_id VARCHAR(64)",
                 # telephony_phone_numbers columns
                 "ALTER TABLE telephony_phone_numbers ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
                 "ALTER TABLE telephony_phone_numbers ADD COLUMN IF NOT EXISTS next_rental_billing_at TIMESTAMPTZ",
                 "ALTER TABLE telephony_phone_numbers ADD COLUMN IF NOT EXISTS rental_status VARCHAR(32) DEFAULT 'active'",
+                "UPDATE subscription_plans SET name = 'Agency Scale Pack' WHERE slug = 'simple_agency'",
+                """CREATE TABLE IF NOT EXISTS sales_inquiries (
+                    id SERIAL PRIMARY KEY,
+                    organization_id INT,
+                    user_email VARCHAR(255),
+                    plan_slug VARCHAR(64),
+                    contact_name VARCHAR(255),
+                    contact_email VARCHAR(255),
+                    contact_phone VARCHAR(64),
+                    notes TEXT,
+                    source VARCHAR(64) DEFAULT 'billing_modal',
+                    status VARCHAR(32) DEFAULT 'new',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )""",
             ]
             async with db_client.async_session() as session:
                 for stmt in statements:
@@ -283,7 +302,7 @@ class PlanService:
                 {
                     "slug": "simple_starter",
                     "name": "Starter",
-                    "description": "Try Callio on your real leads. 40 calling minutes included.",
+                    "description": "Try Callio on your real leads. 40 calling minutes included. Extra calls at ₹6.50/min (strike ₹8.50).",
                     "price_usd": 6.0,
                     "price_inr": 499.0,
                     "billing_interval": "month",
@@ -292,7 +311,7 @@ class PlanService:
                     "included_phone_numbers": 0,
                     "max_concurrent_calls": 1,
                     "max_agents": 2,
-                    "overage_rate_per_minute_usd": 0.10,
+                    "overage_rate_per_minute_usd": 0.076,
                     "byok_platform_fee_per_minute_usd": 0.04,
                     "allow_byok": True,
                     "allow_live_transfer": False,
@@ -300,10 +319,13 @@ class PlanService:
                     "is_active": True,
                     "is_public": True,
                     "features": [
-                        "40 calling minutes",
-                        "All AI Callers included",
+                        "40 calling minutes included",
+                        "₹6.50/min (strike ₹8.50) above 40 min",
+                        "Per-second billing after connect",
+                        "1 Simultaneous calling line",
+                        "All AI Voice Callers included",
                         "Test calls to your own number",
-                        "Call summaries and intent detection",
+                        "Call summaries & intent detection",
                         "Valid for 30 days",
                     ],
                 },
@@ -368,8 +390,8 @@ class PlanService:
                 },
                 {
                     "slug": "simple_agency",
-                    "name": "Business",
-                    "description": "For teams calling every day with dedicated numbers and maximum capacity.",
+                    "name": "Agency Scale Pack",
+                    "description": "For high-volume teams & agencies with dedicated phone numbers and maximum calling capacity.",
                     "price_usd": 240.0,
                     "price_inr": 19999.0,
                     "billing_interval": "month",
@@ -427,6 +449,12 @@ class PlanService:
                         )
                     else:
                         # Always sync mutable fields so code changes take effect
+                        existing.name = p["name"]
+                        existing.description = p["description"]
+                        existing.features = p["features"]
+                        existing.price_inr = p["price_inr"]
+                        existing.price_usd = p["price_usd"]
+                        existing.overage_rate_per_minute_usd = p["overage_rate_per_minute_usd"]
                         existing.allow_byok = p["allow_byok"]
                         existing.allow_live_transfer = p["allow_live_transfer"]
                         existing.allow_sip_trunking = p["allow_sip_trunking"]
@@ -458,7 +486,7 @@ class PlanService:
             all_plans = list(res.scalars().all())
 
             if category == "simple":
-                return [p for p in all_plans if p.slug.startswith("simple_")]
+                return [p for p in all_plans if p.slug.startswith("simple_") or p.slug == "enterprise"]
             elif category == "developer":
                 return [p for p in all_plans if not p.slug.startswith("simple_")]
             return all_plans

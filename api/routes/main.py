@@ -1,5 +1,5 @@
 import secrets
-from typing import Annotated
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from loguru import logger
@@ -341,6 +341,78 @@ def prometheus_metrics(
         headers={"Content-Type": CONTENT_TYPE_LATEST, "Cache-Control": "no-store"},
     )
 
-# Reload trigger for updated routes
+
+class PublicContactFormRequest(BaseModel):
+    name: Optional[str] = None
+    mobile: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    message: Optional[str] = None
+    plan: Optional[str] = None
+
+
+@router.post("/contact")
+async def submit_public_contact_form(request: PublicContactFormRequest):
+    """Receive marketing and public contact form submissions and store in PostgreSQL."""
+    from sqlalchemy import text
+    from api.db import db_client
+
+    c_name = request.name or "Website Visitor"
+    c_phone = request.mobile or request.phone or ""
+    c_email = request.email or ""
+    c_message = request.message or ""
+    c_plan = request.plan or "General Inquiry"
+
+    logger.info(
+        f"[Contact Form Submission] Name: {c_name}, Phone: {c_phone}, Email: {c_email}, Plan: {c_plan}, Message: {c_message}"
+    )
+
+    try:
+        async with db_client.async_session() as session:
+            await session.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS sales_inquiries (
+                        id SERIAL PRIMARY KEY,
+                        organization_id INT,
+                        user_email VARCHAR(255),
+                        plan_slug VARCHAR(64),
+                        contact_name VARCHAR(255),
+                        contact_email VARCHAR(255),
+                        contact_phone VARCHAR(64),
+                        notes TEXT,
+                        source VARCHAR(64) DEFAULT 'billing_modal',
+                        status VARCHAR(32) DEFAULT 'new',
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                    """
+                )
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO sales_inquiries (
+                        user_email, plan_slug, contact_name,
+                        contact_email, contact_phone, notes, source, status
+                    ) VALUES (
+                        :user_email, :plan_slug, :contact_name,
+                        :contact_email, :contact_phone, :notes, 'marketing_contact_form', 'new'
+                    )
+                    """
+                ),
+                {
+                    "user_email": c_email,
+                    "plan_slug": c_plan,
+                    "contact_name": c_name,
+                    "contact_email": c_email,
+                    "contact_phone": c_phone,
+                    "notes": c_message,
+                },
+            )
+            await session.commit()
+    except Exception as exc:
+        logger.warning(f"Failed to persist public contact submission: {exc}")
+
+    return {"ok": True, "message": "Thank you! Your message has been received."}
 
 

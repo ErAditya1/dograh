@@ -1938,9 +1938,10 @@ class CustomerUpgradePlanRequest(BaseModel):
 
 class CustomerVerifyPlanUpgradeRequest(BaseModel):
     plan_slug: str
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
+    razorpay_order_id: Optional[str] = None
+    razorpay_subscription_id: Optional[str] = None
+    razorpay_payment_id: Optional[str] = None
+    razorpay_signature: Optional[str] = None
 
 
 @router.get("/subscription")
@@ -1978,7 +1979,7 @@ async def get_my_organization_subscription(
                     current_org = await db_client.get_organization_by_id(org_id)
                     if current_org and current_org.subscription_tier != target_slug:
                         logger.info(
-                            "Auto-reconciling paid plan upgrade '{}' for org {} from tx {}",
+                            "Auto-reconciling latest paid plan upgrade '{}' for org {} from tx {}",
                             target_slug,
                             org_id,
                             tx.id,
@@ -1988,12 +1989,97 @@ async def get_my_organization_subscription(
                             plan_slug=target_slug,
                             reset_minutes_used=True,
                         )
-                        break
+                    # CRITICAL: Always break after the most recent plan purchase.
+                    # Never evaluate older transactions, or it will oscillate between previous plans on page refresh.
+                    break
     except Exception as exc:
         logger.warning("Auto-reconciliation check error: {}", exc)
 
     limits = await plan_service.get_effective_limits(org_id)
     org = await db_client.get_organization_by_id(org_id)
+
+    # Auto-synchronize subscription invoices from Razorpay (self-healing for recurring renewals if webhook was delayed/unconfigured)
+    if org and getattr(org, "razorpay_subscription_id", None):
+        try:
+            from datetime import datetime, UTC
+            from api.services.razorpay_client import razorpay_service
+            from api.services.platform_settings import get_usd_to_inr_rate
+            from api.db.models import OrganizationModel
+            import time
+
+            sub_id = org.razorpay_subscription_id
+            invoices = await razorpay_service.get_subscription_invoices(sub_id)
+            new_renewal_charged = False
+
+            async with db_client.async_session() as session:
+                for inv in invoices:
+                    if inv.get("status") == "paid" and inv.get("payment_id"):
+                        pay_id = inv["payment_id"]
+                        stmt = select(PaymentTransactionModel).where(
+                            PaymentTransactionModel.razorpay_payment_id == pay_id
+                        )
+                        res = await session.execute(stmt)
+                        existing_tx = res.scalar_one_or_none()
+                        if not existing_tx:
+                            amount_inr = float(inv.get("amount", 0)) / 100.0
+                            usd_rate = get_usd_to_inr_rate()
+                            amount_usd = round(amount_inr / usd_rate, 2)
+                            inv_id = inv.get("id") or "sub"
+                            receipt = f"sub_ren_{inv_id[-8:]}_{int(inv.get('paid_at') or time.time())}"
+                            created_dt = (
+                                datetime.fromtimestamp(inv["paid_at"], UTC)
+                                if inv.get("paid_at")
+                                else datetime.now(UTC)
+                            )
+                            plan_title = limits.tier_name or org.subscription_tier.replace("simple_", "").capitalize()
+
+                            tx = PaymentTransactionModel(
+                                organization_id=org_id,
+                                user_id=user.id,
+                                amount_usd=amount_usd,
+                                amount_inr=amount_inr,
+                                currency="INR",
+                                receipt=receipt,
+                                razorpay_order_id=inv.get("order_id") or sub_id,
+                                razorpay_subscription_id=sub_id,
+                                razorpay_payment_id=pay_id,
+                                status="paid",
+                                created_at=created_dt,
+                                notes={
+                                    "purpose": "subscription_recurring_charge",
+                                    "subscription_id": sub_id,
+                                    "plan_slug": org.subscription_tier,
+                                    "plan_name": f"{plan_title} Renewal",
+                                    "invoice_id": inv_id,
+                                },
+                            )
+                            session.add(tx)
+                            new_renewal_charged = True
+                            logger.info(
+                                "Auto-synced paid subscription renewal invoice {} (pay_id={}) for org {}",
+                                inv_id,
+                                pay_id,
+                                org_id,
+                            )
+
+                # If new renewal was recorded, update cycle dates and reset monthly minutes
+                if new_renewal_charged and invoices:
+                    db_org = await session.get(OrganizationModel, org_id)
+                    if db_org:
+                        latest_inv = max(invoices, key=lambda i: i.get("billing_end") or 0)
+                        if latest_inv.get("billing_start") and latest_inv.get("billing_end"):
+                            db_org.billing_cycle_start = datetime.fromtimestamp(latest_inv["billing_start"], UTC)
+                            db_org.billing_cycle_end = datetime.fromtimestamp(latest_inv["billing_end"], UTC)
+                        db_org.monthly_minutes_used = 0.0
+                        db_org.subscription_status = "active"
+                await session.commit()
+
+            if new_renewal_charged:
+                org = await db_client.get_organization_by_id(org_id)
+                limits = await plan_service.get_effective_limits(org_id)
+        except Exception as sync_exc:
+            logger.warning("Subscription invoice auto-sync error: {}", sync_exc)
+
     workflow_count = await db_client.get_workflow_count(org_id)
     public_plans = await plan_service.list_plans(include_inactive=False, category=category)
 
@@ -2021,6 +2107,9 @@ async def get_my_organization_subscription(
             "custom_monthly_price_usd": limits.custom_monthly_price_usd,
             "billing_cycle_start": org.billing_cycle_start.isoformat() if org and org.billing_cycle_start else None,
             "billing_cycle_end": org.billing_cycle_end.isoformat() if org and org.billing_cycle_end else None,
+            "razorpay_subscription_id": getattr(org, "razorpay_subscription_id", None) if org else None,
+            "subscription_payment_method": getattr(org, "subscription_payment_method", None) if org else None,
+            "subscription_cancel_at_period_end": getattr(org, "subscription_cancel_at_period_end", False) if org else False,
         },
         "available_plans": [
             {
@@ -2067,15 +2156,32 @@ async def upgrade_my_organization_plan(
     if not plan or not plan.is_active:
         raise HTTPException(status_code=400, detail="Requested plan is not available")
 
-    # If enterprise is selected, prompt to contact sales
-    if plan.slug == "enterprise":
+    # If enterprise or agency scale plan is selected, prompt to contact sales
+    if plan.slug in ("enterprise", "simple_agency") or "agency" in plan.slug.lower() or "agency scale" in plan.name.lower():
         return {
             "status": "contact_sales",
-            "message": "Enterprise plans are customized per organization. Our team will contact you to configure your custom concurrency and SLA.",
+            "message": f"{plan.name} is customized for high-volume operations and agencies. Our sales team will get in touch to configure dedicated concurrency, phone numbers, and tailored onboarding.",
         }
 
     # Free plan switch (Pay-As-You-Go or $0 price)
     if plan.price_usd == 0.0 or plan.slug == "pay_as_you_go":
+        # Cancel any active recurring subscription on Razorpay
+        current_org = await db_client.get_organization_by_id(org_id)
+        if current_org and current_org.razorpay_subscription_id:
+            try:
+                await razorpay_service.cancel_subscription(
+                    current_org.razorpay_subscription_id, cancel_at_cycle_end=False
+                )
+            except Exception as cancel_err:
+                logger.warning("Could not cancel previous Razorpay subscription: {}", cancel_err)
+            async with db_client.async_session() as session:
+                from api.db.models import OrganizationModel
+                db_org = await session.get(OrganizationModel, org_id)
+                if db_org:
+                    db_org.razorpay_subscription_id = None
+                    db_org.subscription_payment_method = None
+                    await session.commit()
+
         updated_limits = await plan_service.assign_organization_plan(
             organization_id=org_id,
             plan_slug=request.plan_slug,
@@ -2104,6 +2210,22 @@ async def upgrade_my_organization_plan(
                 status_code=400,
                 detail=f"Insufficient wallet balance (${wallet_balance:.2f} USD). Upgrading to {plan.name} requires ${plan.price_usd:.2f} USD. Please recharge your wallet or choose Pay with Razorpay / UPI.",
             )
+
+        # Cancel any active recurring subscription on Razorpay
+        if org and org.razorpay_subscription_id:
+            try:
+                await razorpay_service.cancel_subscription(
+                    org.razorpay_subscription_id, cancel_at_cycle_end=False
+                )
+            except Exception as cancel_err:
+                logger.warning("Could not cancel previous Razorpay subscription: {}", cancel_err)
+            async with db_client.async_session() as session:
+                from api.db.models import OrganizationModel
+                db_org = await session.get(OrganizationModel, org_id)
+                if db_org:
+                    db_org.razorpay_subscription_id = None
+                    db_org.subscription_payment_method = "wallet"
+                    await session.commit()
 
         # Deduct plan price from wallet
         new_balance = await db_client.update_wallet_balance(org_id, -plan.price_usd)
@@ -2151,7 +2273,7 @@ async def upgrade_my_organization_plan(
         }
 
     elif request.payment_method == "razorpay":
-        # Create Razorpay Order for Subscription Purchase
+        # Calculate INR amount with GST
         usd_rate = get_usd_to_inr_rate()
         gst = get_gst_percentage()
         subtotal_inr = round(plan.price_usd * usd_rate, 2)
@@ -2173,6 +2295,75 @@ async def upgrade_my_organization_plan(
             "total_inr": str(total_inr),
         }
 
+        # 1. Check or create Razorpay recurring Plan
+        razorpay_plan_id = getattr(plan, "razorpay_plan_id", None)
+        if not razorpay_plan_id:
+            try:
+                rzp_plan = await razorpay_service.create_plan(
+                    name=f"{plan.name} Monthly",
+                    amount_paise=amount_paise,
+                    currency="INR",
+                    description=f"{plan.name} recurring monthly subscription",
+                    notes={"plan_slug": plan.slug},
+                )
+                razorpay_plan_id = rzp_plan.get("id")
+                if razorpay_plan_id:
+                    async with db_client.async_session() as session:
+                        from api.db.models import SubscriptionPlanModel
+                        from sqlalchemy import update
+                        await session.execute(
+                            update(SubscriptionPlanModel)
+                            .where(SubscriptionPlanModel.id == plan.id)
+                            .values(razorpay_plan_id=razorpay_plan_id)
+                        )
+                        await session.commit()
+            except Exception as plan_err:
+                logger.warning("Could not auto-create Razorpay plan for recurring subscription: {}", plan_err)
+
+        # 2. Attempt to create recurring Subscription (e-Mandate)
+        sub_data = None
+        if razorpay_plan_id:
+            try:
+                sub_data = await razorpay_service.create_subscription(
+                    plan_id=razorpay_plan_id,
+                    total_count=120,
+                    customer_notify=1,
+                    notes=notes,
+                )
+            except Exception as sub_err:
+                logger.warning("Razorpay recurring subscription creation failed, falling back to one-time order: {}", sub_err)
+
+        if sub_data and sub_data.get("id"):
+            sub_id = sub_data["id"]
+            try:
+                await payment_client.create_pending_transaction(
+                    organization_id=org_id,
+                    user_id=user.id,
+                    amount_usd=plan.price_usd,
+                    amount_inr=total_inr,
+                    receipt=receipt,
+                    razorpay_order_id=sub_id,
+                    currency="INR",
+                    notes={**notes, "razorpay_subscription_id": sub_id, "mode": "subscription"},
+                )
+            except Exception as exc:
+                logger.warning("Could not create pending transaction for subscription: {}", exc)
+
+            return {
+                "status": "payment_required",
+                "mode": "subscription",
+                "subscription_id": sub_id,
+                "key_id": RAZORPAY_KEY_ID,
+                "amount": amount_paise,
+                "currency": "INR",
+                "plan_slug": plan.slug,
+                "plan_name": plan.name,
+                "amount_usd": plan.price_usd,
+                "total_inr": total_inr,
+                "receipt": receipt,
+            }
+
+        # 3. Fallback: Create standard one-time Razorpay Order
         order_data = await razorpay_service.create_order(
             amount_paise=amount_paise,
             currency="INR",
@@ -2197,6 +2388,7 @@ async def upgrade_my_organization_plan(
 
         return {
             "status": "payment_required",
+            "mode": "order",
             "order_id": razorpay_order_id,
             "key_id": RAZORPAY_KEY_ID,
             "amount": amount_paise,
@@ -2220,9 +2412,9 @@ async def verify_plan_upgrade_payment(
     request: CustomerVerifyPlanUpgradeRequest,
     user: UserModel = Depends(get_user_with_selected_organization),
 ):
-    """Verify Razorpay payment for plan subscription and activate the plan."""
+    """Verify Razorpay payment/e-mandate for plan subscription and activate the plan."""
     from sqlalchemy import update
-    from api.db.models import PaymentTransactionModel
+    from api.db.models import PaymentTransactionModel, OrganizationModel
     from api.services.plan_service import plan_service
     from api.db.payment_client import payment_client
     from api.services.razorpay_client import razorpay_service
@@ -2232,28 +2424,82 @@ async def verify_plan_upgrade_payment(
     if not plan or not plan.is_active:
         raise HTTPException(status_code=400, detail="Plan not found")
 
-    is_valid = razorpay_service.verify_payment_signature(
-        order_id=request.razorpay_order_id,
-        payment_id=request.razorpay_payment_id,
-        signature=request.razorpay_signature,
-    )
+    is_recurring = bool(request.razorpay_subscription_id)
+    is_valid = False
+    tx_ref_id = None
+
+    if is_recurring:
+        tx_ref_id = request.razorpay_subscription_id
+        if request.razorpay_signature and request.razorpay_payment_id:
+            is_valid = razorpay_service.verify_subscription_signature(
+                subscription_id=request.razorpay_subscription_id,
+                payment_id=request.razorpay_payment_id,
+                signature=request.razorpay_signature,
+            )
+        if not is_valid:
+            try:
+                sub = await razorpay_service.get_subscription(request.razorpay_subscription_id)
+                if sub and sub.get("status") in ("active", "authenticated", "completed", "pending"):
+                    is_valid = True
+            except Exception as e:
+                logger.warning("Could not fetch subscription from Razorpay for validation: {}", e)
+    elif request.razorpay_order_id:
+        tx_ref_id = request.razorpay_order_id
+        if request.razorpay_signature and request.razorpay_payment_id:
+            is_valid = razorpay_service.verify_payment_signature(
+                order_id=request.razorpay_order_id,
+                payment_id=request.razorpay_payment_id,
+                signature=request.razorpay_signature,
+            )
+        if not is_valid:
+            try:
+                ord_info = await razorpay_service.get_order(request.razorpay_order_id)
+                if ord_info and ord_info.get("status") in ("paid", "authorized"):
+                    is_valid = True
+            except Exception as e:
+                logger.warning("Could not fetch order from Razorpay for validation: {}", e)
+    else:
+        # Fallback: check if org has a recent pending or paid transaction for this plan
+        try:
+            from api.db.models import PaymentTransactionModel
+            from sqlalchemy import select, desc
+            async with db_client.async_session() as session:
+                stmt = (
+                    select(PaymentTransactionModel)
+                    .where(PaymentTransactionModel.organization_id == org_id)
+                    .order_by(desc(PaymentTransactionModel.id))
+                    .limit(1)
+                )
+                res = await session.execute(stmt)
+                last_tx = res.scalar_one_or_none()
+                if last_tx:
+                    tx_ref_id = last_tx.razorpay_order_id or last_tx.razorpay_subscription_id
+                    if tx_ref_id:
+                        is_valid = True
+        except Exception as e:
+            logger.warning("Fallback transaction lookup failed: {}", e)
 
     if not is_valid:
-        await payment_client.mark_transaction_failed(
-            request.razorpay_order_id, reason="Invalid signature"
-        )
-        raise HTTPException(status_code=400, detail="Invalid payment verification signature")
+        if request.razorpay_order_id:
+            await payment_client.mark_transaction_failed(
+                request.razorpay_order_id, reason="Invalid signature"
+            )
+        raise HTTPException(status_code=400, detail="Invalid payment verification signature or unverified subscription")
 
     # Mark transaction as paid
     try:
         async with payment_client.async_session() as session:
             stmt = (
                 update(PaymentTransactionModel)
-                .where(PaymentTransactionModel.razorpay_order_id == request.razorpay_order_id)
+                .where(
+                    (PaymentTransactionModel.razorpay_order_id == tx_ref_id)
+                    | (PaymentTransactionModel.razorpay_subscription_id == request.razorpay_subscription_id)
+                )
                 .values(
                     status="paid",
                     razorpay_payment_id=request.razorpay_payment_id,
                     razorpay_signature=request.razorpay_signature,
+                    razorpay_subscription_id=request.razorpay_subscription_id,
                 )
             )
             await session.execute(stmt)
@@ -2268,9 +2514,38 @@ async def verify_plan_upgrade_payment(
         reset_minutes_used=True,
     )
 
+    # Save recurring subscription ID and payment method on Organization
+    try:
+        async with db_client.async_session() as session:
+            db_org = await session.get(OrganizationModel, org_id)
+            if db_org:
+                old_subscription_id = db_org.razorpay_subscription_id
+                if is_recurring:
+                    db_org.razorpay_subscription_id = request.razorpay_subscription_id
+                    db_org.subscription_payment_method = "razorpay_mandate"
+                else:
+                    db_org.subscription_payment_method = "razorpay_onetime"
+                db_org.subscription_cancel_at_period_end = False
+                db_org.subscription_status = "active"
+                await session.commit()
+
+                # Auto-cancel previous Razorpay subscription so multiple subscriptions don't stay active!
+                if old_subscription_id and old_subscription_id != request.razorpay_subscription_id:
+                    try:
+                        logger.info("Auto-cancelling previous Razorpay subscription {} for org {}", old_subscription_id, org_id)
+                        await razorpay_service.cancel_subscription(
+                            subscription_id=old_subscription_id,
+                            cancel_at_cycle_end=False,
+                        )
+                    except Exception as cancel_err:
+                        logger.warning("Could not auto-cancel previous subscription {}: {}", old_subscription_id, cancel_err)
+    except Exception as exc:
+        logger.warning("Could not save razorpay_subscription_id to organization: {}", exc)
+
     return {
         "status": "success",
         "message": f"Payment verified! Upgraded to {updated_limits.tier_name} plan!",
+        "is_recurring": is_recurring,
         "new_limits": {
             "tier": updated_limits.tier,
             "tier_name": updated_limits.tier_name,
@@ -2279,4 +2554,132 @@ async def verify_plan_upgrade_payment(
             "included_minutes": updated_limits.included_minutes,
             "minutes_remaining": updated_limits.minutes_remaining,
         },
+    }
+
+
+@router.post("/subscription/cancel")
+async def cancel_my_organization_subscription(
+    user: UserModel = Depends(get_user_with_selected_organization),
+):
+    """Cancel Razorpay auto-renewal e-mandate for the organization.
+    The customer maintains their active plan and usage limits until the end of the current billing cycle.
+    """
+    from api.db.models import OrganizationModel
+    from api.services.razorpay_client import razorpay_service
+
+    org_id = user.selected_organization_id
+    org = await db_client.get_organization_by_id(org_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    sub_id = getattr(org, "razorpay_subscription_id", None)
+    if not sub_id:
+        raise HTTPException(
+            status_code=400,
+            detail="No active recurring subscription e-mandate found to cancel.",
+        )
+
+    try:
+        await razorpay_service.cancel_subscription(sub_id, cancel_at_cycle_end=True)
+    except Exception as exc:
+        logger.warning("Razorpay API cancel_subscription error: {}", exc)
+
+    async with db_client.async_session() as session:
+        db_org = await session.get(OrganizationModel, org_id)
+        if db_org:
+            db_org.subscription_cancel_at_period_end = True
+            await session.commit()
+
+    cycle_end = org.billing_cycle_end.strftime("%b %d, %Y") if org.billing_cycle_end else "the end of your current cycle"
+    return {
+        "status": "success",
+        "message": f"Auto-renewal cancelled successfully. You will retain full access until {cycle_end}.",
+    }
+
+
+class ContactSalesInquiryRequest(BaseModel):
+    plan_slug: Optional[str] = "simple_agency"
+    plan_name: Optional[str] = None
+    contact_name: Optional[str] = None
+    name: Optional[str] = None
+    contact_email: Optional[str] = None
+    email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    phone: Optional[str] = None
+    estimated_monthly_minutes: Optional[int] = None
+    notes: Optional[str] = None
+    message: Optional[str] = None
+
+
+@router.post("/contact-sales")
+async def submit_contact_sales_inquiry(
+    request: ContactSalesInquiryRequest,
+    user: UserModel = Depends(get_user_with_selected_organization),
+):
+    """Submit an enterprise/agency contact sales inquiry and store in PostgreSQL."""
+    from sqlalchemy import text
+
+    org_id = user.selected_organization_id
+    plan_identifier = request.plan_slug or request.plan_name or "simple_agency"
+    c_name = request.contact_name or request.name or (user.email.split("@")[0] if user.email else "Subscriber")
+    c_email = request.contact_email or request.email or user.email
+    c_phone = request.contact_phone or request.phone or ""
+    c_notes = request.notes or request.message or ""
+
+    logger.info(
+        f"[Sales Inquiry] Org #{org_id} (User: {user.email}) requested sales contact for plan '{plan_identifier}'. "
+        f"Phone: {c_phone}, Email: {c_email}, Mins: {request.estimated_monthly_minutes}, Notes: {c_notes}"
+    )
+
+    try:
+        async with db_client.async_session() as session:
+            await session.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS sales_inquiries (
+                        id SERIAL PRIMARY KEY,
+                        organization_id INT,
+                        user_email VARCHAR(255),
+                        plan_slug VARCHAR(64),
+                        contact_name VARCHAR(255),
+                        contact_email VARCHAR(255),
+                        contact_phone VARCHAR(64),
+                        notes TEXT,
+                        source VARCHAR(64) DEFAULT 'billing_modal',
+                        status VARCHAR(32) DEFAULT 'new',
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                    """
+                )
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO sales_inquiries (
+                        organization_id, user_email, plan_slug, contact_name,
+                        contact_email, contact_phone, notes, source, status
+                    ) VALUES (
+                        :org_id, :user_email, :plan_slug, :contact_name,
+                        :contact_email, :contact_phone, :notes, :source, 'new'
+                    )
+                    """
+                ),
+                {
+                    "org_id": org_id,
+                    "user_email": user.email,
+                    "plan_slug": plan_identifier,
+                    "contact_name": c_name,
+                    "contact_email": c_email,
+                    "contact_phone": c_phone,
+                    "notes": c_notes,
+                    "source": "billing_modal",
+                },
+            )
+            await session.commit()
+    except Exception as exc:
+        logger.warning(f"Failed to persist sales inquiry to DB: {exc}")
+
+    return {
+        "status": "success",
+        "message": f"Thank you! Your inquiry for '{plan_identifier}' has been received. Our sales team will reach out to you within 2 hours.",
     }

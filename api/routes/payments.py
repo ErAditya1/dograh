@@ -78,11 +78,12 @@ class PaymentTransactionItem(BaseModel):
     id: int
     organization_id: int
     receipt: str
+    description: Optional[str] = None
     amount_usd: float
     amount_inr: float = 0.0
     currency: str = "INR"
     status: str
-    razorpay_order_id: str
+    razorpay_order_id: Optional[str] = None
     razorpay_payment_id: Optional[str] = None
     created_at: Optional[datetime] = None
 
@@ -346,6 +347,167 @@ async def razorpay_webhook(
             except Exception as exc:
                 logger.error(f"[Razorpay Webhook] Error updating wallet balance: {exc}")
 
+    elif event_type == "subscription.charged":
+        subscription_entity = (
+            event_data.get("payload", {}).get("subscription", {}).get("entity", {})
+        )
+        payment_entity = (
+            event_data.get("payload", {}).get("payment", {}).get("entity", {})
+        )
+        sub_id = subscription_entity.get("id")
+        payment_id = payment_entity.get("id")
+        notes = subscription_entity.get("notes", {}) or {}
+        org_id_val = notes.get("organization_id")
+        plan_slug = notes.get("plan_slug")
+
+        logger.info(
+            f"[Razorpay Webhook] subscription.charged: sub_id={sub_id}, payment_id={payment_id}, org_id={org_id_val}"
+        )
+
+        from api.db.models import OrganizationModel, PaymentTransactionModel
+        from api.services.plan_service import plan_service
+        from sqlalchemy import select
+        from datetime import datetime, UTC, timedelta
+        import time
+
+        async with db_client.async_session() as session:
+            org = None
+            if org_id_val and str(org_id_val).isdigit():
+                org = await session.get(OrganizationModel, int(org_id_val))
+            if not org and sub_id:
+                stmt = select(OrganizationModel).where(OrganizationModel.razorpay_subscription_id == sub_id)
+                res = await session.execute(stmt)
+                org = res.scalars().first()
+
+            if org:
+                now = datetime.now(UTC)
+                org.billing_cycle_start = now
+                org.billing_cycle_end = now + timedelta(days=30)
+                org.monthly_minutes_used = 0.0
+                org.subscription_status = "active"
+
+                plan_to_use = plan_slug or org.subscription_tier
+                plan = await plan_service.get_plan_by_slug(plan_to_use)
+                if plan and getattr(plan, "monthly_credits_usd", 0.0):
+                    org.plan_credits_monthly_usd = float(plan.monthly_credits_usd)
+                    org.plan_credits_remaining_usd = float(plan.monthly_credits_usd)
+                    org.plan_credits_reset_at = now + timedelta(days=30)
+
+                amount_inr = float(payment_entity.get("amount", 0)) / 100.0
+                usd_rate = get_usd_to_inr_rate()
+                amount_usd = round(amount_inr / usd_rate, 2)
+                receipt = f"sub_ren_{sub_id[-8:] if sub_id else 'unk'}_{int(time.time())}"
+
+                tx_stmt = select(PaymentTransactionModel).where(
+                    PaymentTransactionModel.razorpay_payment_id == payment_id
+                )
+                tx_res = await session.execute(tx_stmt)
+                existing_tx = tx_res.scalars().first()
+
+                if not existing_tx:
+                    tx = PaymentTransactionModel(
+                        organization_id=org.id,
+                        user_id=None,
+                        amount_usd=amount_usd,
+                        amount_inr=amount_inr,
+                        currency="INR",
+                        receipt=receipt,
+                        razorpay_order_id=payment_entity.get("order_id") or (sub_id or ""),
+                        razorpay_subscription_id=sub_id,
+                        razorpay_payment_id=payment_id,
+                        razorpay_signature=x_razorpay_signature,
+                        status="paid",
+                        notes={
+                            "event": "subscription.charged",
+                            "subscription_id": sub_id,
+                            "plan_slug": plan_to_use,
+                            "purpose": "subscription_recurring_charge",
+                        },
+                    )
+                    session.add(tx)
+
+                await session.commit()
+                logger.info(
+                    f"[Razorpay Webhook] Recurring subscription charged for Org {org.id}. "
+                    f"New cycle ends at {org.billing_cycle_end}."
+                )
+
+    elif event_type == "subscription.halted":
+        subscription_entity = (
+            event_data.get("payload", {}).get("subscription", {}).get("entity", {})
+        )
+        sub_id = subscription_entity.get("id")
+        notes = subscription_entity.get("notes", {}) or {}
+        org_id_val = notes.get("organization_id")
+
+        logger.warning(f"[Razorpay Webhook] subscription.halted for sub_id={sub_id}")
+        from api.db.models import OrganizationModel
+        from sqlalchemy import select
+
+        async with db_client.async_session() as session:
+            org = None
+            if org_id_val and str(org_id_val).isdigit():
+                org = await session.get(OrganizationModel, int(org_id_val))
+            if not org and sub_id:
+                stmt = select(OrganizationModel).where(OrganizationModel.razorpay_subscription_id == sub_id)
+                res = await session.execute(stmt)
+                org = res.scalars().first()
+
+            if org:
+                org.subscription_status = "halted"
+                await session.commit()
+                logger.warning(f"[Razorpay Webhook] Organization {org.id} subscription status set to 'halted'.")
+
+    elif event_type == "subscription.cancelled":
+        subscription_entity = (
+            event_data.get("payload", {}).get("subscription", {}).get("entity", {})
+        )
+        sub_id = subscription_entity.get("id")
+        notes = subscription_entity.get("notes", {}) or {}
+        org_id_val = notes.get("organization_id")
+
+        from api.db.models import OrganizationModel
+        from sqlalchemy import select
+
+        async with db_client.async_session() as session:
+            org = None
+            if org_id_val and str(org_id_val).isdigit():
+                org = await session.get(OrganizationModel, int(org_id_val))
+            if not org and sub_id:
+                stmt = select(OrganizationModel).where(OrganizationModel.razorpay_subscription_id == sub_id)
+                res = await session.execute(stmt)
+                org = res.scalars().first()
+
+            if org:
+                org.subscription_status = "cancelled"
+                org.razorpay_subscription_id = None
+                await session.commit()
+                logger.info(f"[Razorpay Webhook] Organization {org.id} subscription cancelled.")
+
+    elif event_type in ("subscription.authenticated", "subscription.activated"):
+        subscription_entity = (
+            event_data.get("payload", {}).get("subscription", {}).get("entity", {})
+        )
+        sub_id = subscription_entity.get("id")
+        notes = subscription_entity.get("notes", {}) or {}
+        org_id_val = notes.get("organization_id")
+
+        from api.db.models import OrganizationModel
+        from sqlalchemy import select
+
+        async with db_client.async_session() as session:
+            org = None
+            if org_id_val and str(org_id_val).isdigit():
+                org = await session.get(OrganizationModel, int(org_id_val))
+            if not org and sub_id:
+                stmt = select(OrganizationModel).where(OrganizationModel.razorpay_subscription_id == sub_id)
+                res = await session.execute(stmt)
+                org = res.scalars().first()
+
+            if org:
+                org.subscription_status = "active"
+                await session.commit()
+
     return {"status": "ok"}
 
 
@@ -368,19 +530,35 @@ async def list_transactions(
         limit=limit,
     )
 
-    return [
-        PaymentTransactionItem(
-            id=tx.id,
-            organization_id=tx.organization_id,
-            receipt=tx.receipt,
-            amount_usd=tx.amount_usd,
-            amount_inr=getattr(tx, "amount_inr", 0.0) or 0.0,
-            currency=tx.currency or "INR",
-            status=tx.status,
-            razorpay_order_id=tx.razorpay_order_id,
-            razorpay_payment_id=tx.razorpay_payment_id,
-            created_at=tx.created_at,
+    items = []
+    for tx in transactions:
+        notes = tx.notes if isinstance(tx.notes, dict) else (json.loads(tx.notes) if tx.notes else {})
+        plan_name = notes.get("plan_name")
+        purpose = notes.get("purpose")
+        if plan_name:
+            desc_text = f"Plan: {plan_name}"
+        elif purpose == "calling_wallet_recharge":
+            desc_text = f"Wallet Recharge (${tx.amount_usd:.2f} USD)"
+        elif purpose == "subscription_recurring_charge":
+            desc_text = f"Auto-Pay Renewal: {plan_name or 'Subscription'}"
+        else:
+            desc_text = tx.receipt or "Payment"
+
+        items.append(
+            PaymentTransactionItem(
+                id=tx.id,
+                organization_id=tx.organization_id,
+                receipt=tx.receipt or "",
+                description=desc_text,
+                amount_usd=tx.amount_usd or 0.0,
+                amount_inr=getattr(tx, "amount_inr", 0.0) or 0.0,
+                currency=tx.currency or "INR",
+                status=tx.status,
+                razorpay_order_id=tx.razorpay_order_id,
+                razorpay_payment_id=tx.razorpay_payment_id,
+                created_at=tx.created_at,
+            )
         )
-        for tx in transactions
-    ]
+
+    return items
 

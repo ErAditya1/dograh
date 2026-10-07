@@ -938,6 +938,8 @@ async def delete_subscription_plan_admin(
         if not plan:
             raise HTTPException(status_code=404, detail=f"Plan '{slug}' not found")
 
+        plan_name = plan.name
+
         # Check if plan is currently active on any organization
         org_stmt = select(OrganizationModel).where(OrganizationModel.subscription_tier == slug)
         org_res = await session.execute(org_stmt)
@@ -949,7 +951,7 @@ async def delete_subscription_plan_admin(
             plan.is_public = False
             await session.commit()
             return {
-                "message": f"Plan '{plan.name}' is currently used by organizations. Deactivated and unpublished.",
+                "message": f"Plan '{plan_name}' is currently used by organizations. Deactivated and unpublished.",
                 "deleted": False,
                 "deactivated": True,
             }
@@ -957,7 +959,7 @@ async def delete_subscription_plan_admin(
         await session.delete(plan)
         await session.commit()
         return {
-            "message": f"Plan '{plan.name}' ({slug}) deleted successfully.",
+            "message": f"Plan '{plan_name}' ({slug}) deleted successfully.",
             "deleted": True,
         }
 
@@ -1081,3 +1083,44 @@ async def set_organization_plan_admin(
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/inquiries")
+async def list_sales_inquiries_admin(
+    current_user: UserModel = Depends(get_superuser),
+):
+    """List all sales inquiries and contact form submissions collected across the platform."""
+    from sqlalchemy import text
+
+    async with db_client.async_session() as session:
+        try:
+            stmt = text(
+                """
+                SELECT id, organization_id, user_email, plan_slug, contact_name,
+                       contact_email, contact_phone, notes, source, status, created_at
+                FROM sales_inquiries
+                ORDER BY created_at DESC
+                LIMIT 100
+                """
+            )
+            res = await session.execute(stmt)
+            rows = res.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "organization_id": r[1],
+                    "user_email": r[2],
+                    "plan_slug": r[3],
+                    "contact_name": r[4],
+                    "contact_email": r[5],
+                    "contact_phone": r[6],
+                    "notes": r[7],
+                    "source": r[8],
+                    "status": r[9],
+                    "created_at": r[10].isoformat() if r[10] else None,
+                }
+                for r in rows
+            ]
+        except Exception:
+            return []
+

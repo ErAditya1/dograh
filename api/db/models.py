@@ -196,6 +196,11 @@ class OrganizationModel(Base):
     custom_byok_platform_fee_usd = Column(Float, nullable=True)
     custom_allow_live_transfer = Column(Boolean, nullable=True)
     custom_allow_sip_trunking = Column(Boolean, nullable=True)
+    razorpay_subscription_id = Column(String(64), nullable=True, index=True)
+    subscription_payment_method = Column(String(32), nullable=True)
+    subscription_cancel_at_period_end = Column(
+        Boolean, nullable=True, default=False, server_default=text("false")
+    )
 
     # Relationships
     users = relationship(
@@ -1672,6 +1677,7 @@ class PaymentTransactionModel(Base):
     currency = Column(String(8), nullable=False, default="INR", server_default=text("'INR'"))
     receipt = Column(String(64), nullable=False, unique=True, index=True)
     razorpay_order_id = Column(String(64), nullable=False, index=True)
+    razorpay_subscription_id = Column(String(64), nullable=True, index=True)
     razorpay_payment_id = Column(String(64), nullable=True, index=True)
     razorpay_signature = Column(String(256), nullable=True)
     status = Column(String(32), nullable=False, default="created", server_default=text("'created'"))
@@ -1721,6 +1727,7 @@ class SubscriptionPlanModel(Base):
     allow_byok = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     allow_live_transfer = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     allow_sip_trunking = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    razorpay_plan_id = Column(String(64), nullable=True, index=True)
     is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     is_public = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     features = Column(JSON, nullable=False, default=list, server_default=text("'[]'::json"))
