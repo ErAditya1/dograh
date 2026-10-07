@@ -302,7 +302,7 @@ class PlanService:
                 {
                     "slug": "simple_starter",
                     "name": "Starter",
-                    "description": "Try Callio on your real leads. 40 calling minutes included. Extra calls at ₹6.50/min (strike ₹8.50).",
+                    "description": "Try Callio on your real leads. 40 calling minutes included. Extra calls at ₹6.50/min.",
                     "price_usd": 6.0,
                     "price_inr": 499.0,
                     "billing_interval": "month",
@@ -320,7 +320,7 @@ class PlanService:
                     "is_public": True,
                     "features": [
                         "40 calling minutes included",
-                        "₹6.50/min (strike ₹8.50) above 40 min",
+                        "₹6.50/min above 40 min",
                         "Per-second billing after connect",
                         "1 Simultaneous calling line",
                         "All AI Voice Callers included",
