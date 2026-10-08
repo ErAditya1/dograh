@@ -24,6 +24,7 @@ def _config_loader(value: Dict[str, Any]) -> Dict[str, Any]:
             "smartflo_api_domain", "https://api-smartflo.tatateleservices.com"
         ),
         "from_numbers": value.get("from_numbers", []),
+        "phone_numbers_metadata": value.get("phone_numbers_metadata", {}),
     }
 
 

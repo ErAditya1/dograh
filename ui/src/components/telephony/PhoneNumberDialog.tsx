@@ -189,7 +189,7 @@ export function PhoneNumberDialog({
       if (providerSync && !providerSync.ok) {
         toast.warning(
           providerSync.message ??
-            "Saved, but failed to sync inbound webhook to the provider.",
+          "Saved, but failed to sync inbound webhook to the provider.",
         );
       }
       onOpenChange(false);

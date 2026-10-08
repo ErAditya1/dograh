@@ -523,16 +523,16 @@ export default function TelephonyConfigurationDetailPage() {
                         {config.trunks?.find(
                           (t) => t.id === n.telephony_trunk_id,
                         )?.name ?? (
-                          <span
-                            className={
-                              (config.trunks?.length ?? 0) > 1
-                                ? "text-amber-600 dark:text-amber-500"
-                                : undefined
-                            }
-                          >
-                            Unassigned
-                          </span>
-                        )}
+                            <span
+                              className={
+                                (config.trunks?.length ?? 0) > 1
+                                  ? "text-amber-600 dark:text-amber-500"
+                                  : undefined
+                              }
+                            >
+                              Unassigned
+                            </span>
+                          )}
                       </TableCell>
                     )}
                     <TableCell className="text-right">

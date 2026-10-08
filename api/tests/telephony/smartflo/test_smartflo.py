@@ -109,6 +109,26 @@ def test_credential_resolution_priority():
         assert did == "env_did"
         assert jwt == "env_jwt"
 
+    # Priority 3.5: Per-Number Metadata overrides Org Config
+    api_key, did, jwt, domain = resolve_smartflo_credentials(
+        call_details={},
+        agent_config={},
+        org_config={
+            "smartflo_api_key": "org_default_key",
+            "smartflo_did_number": "org_default_did",
+            "phone_numbers_metadata": {
+                "918888888888": {
+                    "click_to_call_api_key": "number_dedicated_key",
+                    "smartflo_jwt_token": "number_dedicated_jwt",
+                }
+            },
+        },
+        from_number="918888888888",
+    )
+    assert api_key == "number_dedicated_key"
+    assert did == "918888888888"
+    assert jwt == "number_dedicated_jwt"
+
     # Validation: Missing required fields must raise ValueError
     with patch.dict(os.environ, {}, clear=True):
         with pytest.raises(ValueError, match="Missing required Smartflo Click-to-Call API Key"):
@@ -267,3 +287,44 @@ async def test_smartflo_provider_initiate_call_success():
         assert sent_payload["caller_id"] == "911111111111"
         assert sent_payload["api_key"] == "test_api_key"
         assert sent_payload["custom_identifier"] == "999"
+
+
+@pytest.mark.asyncio
+async def test_smartflo_provider_initiate_call_with_dedicated_from_number():
+    provider = SmartfloProvider({
+        "click_to_call_api_key": "org_default_api_key",
+        "smartflo_did_number": "911111111111",
+        "phone_numbers_metadata": {
+            "912222222222": {
+                "click_to_call_api_key": "dedicated_did2_api_key",
+            }
+        },
+    })
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "status": "success",
+        "ref_id": "ref_did2_123",
+        "call_id": "call_did2_456",
+    }
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post, \
+         patch("api.services.telephony.providers.smartflo.provider.save_smartflo_call_state", new_callable=AsyncMock):
+        mock_post.return_value = mock_resp
+
+        result = await provider.initiate_call(
+            to_number="919999999999",
+            webhook_url="https://example.com/smartflo_connect",
+            workflow_run_id=888,
+            from_number="912222222222",
+        )
+
+        assert result.call_id == "call_did2_456"
+        mock_post.assert_awaited_once()
+        sent_payload = mock_post.await_args.kwargs["json"]
+        assert sent_payload["customer_number"] == "919999999999"
+        # Must use explicitly specified from_number as caller_id
+        assert sent_payload["caller_id"] == "912222222222"
+        # Must use dedicated API key for that number
+        assert sent_payload["api_key"] == "dedicated_did2_api_key"

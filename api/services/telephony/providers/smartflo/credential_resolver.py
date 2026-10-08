@@ -8,6 +8,7 @@ Resolution priority:
 """
 
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
 
 
@@ -25,9 +26,17 @@ def resolve_smartflo_credentials(
     call_details: Optional[Dict[str, Any]] = None,
     agent_config: Optional[Dict[str, Any]] = None,
     org_config: Optional[Dict[str, Any]] = None,
+    from_number: Optional[str] = None,
 ) -> Tuple[str, str, str, str]:
     """
     Resolve Smartflo credentials according to strict priority order.
+
+    Resolution priority:
+    1. Request Body (call_details)
+    2. Per-number extra_metadata (if a specific caller ID is dialed from)
+    3. Agent configuration (workflow_configurations)
+    4. Organization configuration (telephony_configurations)
+    5. Environment variables
 
     Returns:
         Tuple of (click_to_call_api_key, did_number, jwt_token, api_domain)
@@ -39,20 +48,46 @@ def resolve_smartflo_credentials(
     agent_config = agent_config or {}
     org_config = org_config or {}
 
-    # 1. Click-to-Call API Key (Request > Org Config > Environment)
+    # Extract target number to check for per-number credentials
+    phone_metadata = org_config.get("phone_numbers_metadata") or {}
+    target_meta: Dict[str, Any] = {}
+
+    number_candidates = [
+        str(from_number or "").strip(),
+        str(call_details.get("caller_id") or "").strip(),
+        str(call_details.get("from_number") or "").strip(),
+    ]
+    for num in number_candidates:
+        if not num:
+            continue
+        clean_d = re.sub(r"[^\d]", "", num)
+        if num in phone_metadata:
+            target_meta = phone_metadata[num] or {}
+            break
+        if clean_d and clean_d in phone_metadata:
+            target_meta = phone_metadata[clean_d] or {}
+            break
+
+    # 1. Click-to-Call API Key (Request > Per-Number Metadata > Agent Config > Org Config > Environment)
     click_to_call_api_key = (
         call_details.get("smartflo_api_key")
         or call_details.get("click_to_call_api_key")
+        or target_meta.get("click_to_call_api_key")
+        or target_meta.get("smartflo_api_key")
+        or target_meta.get("api_key")
+        or agent_config.get("smartflo_api_key")
+        or agent_config.get("click_to_call_api_key")
         or org_config.get("click_to_call_api_key")
         or os.getenv("SMARTFLO_CLICK_TO_CALL_API_KEY")
     )
 
-    # 2. DID Number / Caller ID (Request > Org Default Phone > Environment)
+    # 2. DID Number / Caller ID (Explicit from_number > Request > Org Default Phone > Environment)
     from_numbers = org_config.get("from_numbers") or []
     first_from_number = from_numbers[0] if isinstance(from_numbers, list) and from_numbers else None
 
     did_number = (
-        call_details.get("caller_id")
+        from_number
+        or call_details.get("caller_id")
         or call_details.get("from_number")
         or call_details.get("smartflo_did_number")
         or org_config.get("default_from_number")
@@ -61,9 +96,12 @@ def resolve_smartflo_credentials(
         or os.getenv("SMARTFLO_DID_NUMBER")
     )
 
-    # 3. JWT Token (Request > Org Config > Environment)
+    # 3. JWT Token (Request > Per-Number Metadata > Agent Config > Org Config > Environment)
     jwt_token = (
         call_details.get("smartflo_jwt_token")
+        or target_meta.get("smartflo_jwt_token")
+        or target_meta.get("jwt_token")
+        or agent_config.get("smartflo_jwt_token")
         or org_config.get("smartflo_jwt_token")
         or os.getenv("SMARTFLO_JWT_TOKEN")
     )
@@ -71,6 +109,7 @@ def resolve_smartflo_credentials(
     # 4. API Domain
     api_domain = (
         call_details.get("smartflo_api_domain")
+        or target_meta.get("smartflo_api_domain")
         or org_config.get("smartflo_api_domain")
         or os.getenv("SMARTFLO_API_DOMAIN", "https://api-smartflo.tatateleservices.com")
     )

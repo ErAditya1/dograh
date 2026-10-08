@@ -17,6 +17,7 @@ receive a normalized config dict containing credentials plus a
 joining ``telephony_phone_numbers``.
 """
 
+import re
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from loguru import logger
@@ -344,6 +345,20 @@ async def _normalize_with_phone_numbers(
 
     addresses = await db_client.list_active_normalized_addresses_for_config(row.id)
     base["from_numbers"] = addresses
+
+    # Attach per-number metadata so providers can access per-number credentials (e.g. Smartflo)
+    phone_numbers = await db_client.list_phone_numbers_for_config(row.id)
+    phone_numbers_metadata: Dict[str, Any] = {}
+    for pn in phone_numbers:
+        if pn.is_active and pn.extra_metadata:
+            meta = dict(pn.extra_metadata)
+            phone_numbers_metadata[pn.address_normalized] = meta
+            digits = re.sub(r"[^\d]", "", pn.address_normalized)
+            if digits:
+                phone_numbers_metadata[digits] = meta
+            if pn.address and pn.address != pn.address_normalized:
+                phone_numbers_metadata[pn.address] = meta
+    base["phone_numbers_metadata"] = phone_numbers_metadata
 
     default_row = await db_client.get_default_caller_id(row.id)
     # Membership in the active-address list also guards against a default

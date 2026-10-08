@@ -82,10 +82,11 @@ class SmartfloProvider(TelephonyProvider):
 
         Endpoint: POST {SMARTFLO_API_DOMAIN}/v1/click_to_call_support
         """
-        # Resolve credentials with 4-tier fallback
+        # Resolve credentials with 4-tier fallback (including per-number metadata)
         api_key, did, jwt_token, api_domain = resolve_smartflo_credentials(
             call_details=kwargs,
             org_config=self.config,
+            from_number=from_number,
         )
 
         # Smartflo strictly accepts only numeric digits (no '+', '-', or spaces)
@@ -98,8 +99,8 @@ class SmartfloProvider(TelephonyProvider):
         clean_did = clean_num(did)
         clean_from = clean_num(from_number)
         
-        # Priority for caller_id: use configured DID if present, else cleaned from_number
-        caller_id = clean_did if clean_did else clean_from
+        # Priority for caller_id: use explicitly selected from_number if present, else fallback to configured DID
+        caller_id = clean_from if clean_from else clean_did
 
         # Safe logging - NEVER log credentials or raw tokens
         logger.info(
