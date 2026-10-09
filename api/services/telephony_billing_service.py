@@ -147,6 +147,7 @@ class TelephonyBillingService:
                     claimed_at=now,
                     next_rental_billing_at=now + timedelta(days=30),
                     rental_status="active",
+                    extra_metadata=dict(num.extra_metadata or {}),
                 )
                 session.add(org_num)
             else:
@@ -155,6 +156,8 @@ class TelephonyBillingService:
                 org_num.is_platform_inventory = True
                 org_num.rental_status = "active"
                 org_num.next_rental_billing_at = now + timedelta(days=30)
+                if num.extra_metadata:
+                    org_num.extra_metadata = dict(num.extra_metadata or {})
                 if set_as_default:
                     org_num.is_default_caller_id = True
 

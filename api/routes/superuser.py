@@ -544,6 +544,7 @@ class StockNumberItem(BaseModel):
     pool_type: str = "dedicated"  # 'dedicated', 'shared_trial', or 'shared_multi_org'
     monthly_price_cents: int = 0
     label: Optional[str] = None
+    extra_metadata: Optional[dict] = None
 
 
 class PlatformTelephonyInventoryCreateRequest(BaseModel):
@@ -622,6 +623,7 @@ async def add_telephony_inventory(
                 )
             ).scalar_one_or_none()
 
+            item_meta = dict(item.extra_metadata or {})
             if existing:
                 existing.telephony_configuration_id = config_id
                 existing.is_platform_inventory = True
@@ -630,6 +632,10 @@ async def add_telephony_inventory(
                 if item.label:
                     existing.label = item.label
                 existing.is_active = True
+                if item_meta:
+                    merged_meta = dict(existing.extra_metadata or {})
+                    merged_meta.update(item_meta)
+                    existing.extra_metadata = merged_meta
                 created_numbers.append(item.address)
             else:
                 num_row = TelephonyPhoneNumberModel(
@@ -645,6 +651,7 @@ async def add_telephony_inventory(
                     is_platform_inventory=True,
                     pool_type=item.pool_type,
                     monthly_price_cents=item.monthly_price_cents,
+                    extra_metadata=item_meta,
                 )
                 session.add(num_row)
                 created_numbers.append(item.address)

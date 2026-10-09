@@ -563,6 +563,7 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                     "assigned_organization_id": num.assigned_organization_id,
                     "claimed_count": claimed_counts.get(num.address_normalized, 1 if num.assigned_organization_id else 0),
                     "is_active": num.is_active,
+                    "extra_metadata": num.extra_metadata or {},
                     "created_at": num.created_at.isoformat() if num.created_at else None,
                 }
                 for num, config in rows
@@ -660,11 +661,14 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                     is_default_caller_id=set_as_default,
                     pool_type=num.pool_type,
                     is_platform_inventory=False,
+                    extra_metadata=dict(num.extra_metadata or {}),
                 )
                 session.add(org_num)
             else:
                 org_num.telephony_configuration_id = existing_org_config.id
                 org_num.is_active = True
+                if num.extra_metadata:
+                    org_num.extra_metadata = dict(num.extra_metadata or {})
                 if set_as_default:
                     org_num.is_default_caller_id = True
 
