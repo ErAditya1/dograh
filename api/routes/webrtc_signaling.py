@@ -477,6 +477,15 @@ class SignalingManager:
                             f"Failed to disconnect peer connection {pc_id}: {e}"
                         )
 
+            # Ensure concurrency slot is freed when WebSocket terminates
+            if enforce_call_concurrency and workflow_run_id:
+                try:
+                    await call_concurrency.unregister_active_call(workflow_run_id)
+                except Exception as ce:
+                    logger.debug(
+                        f"Failed to unregister call slot on websocket disconnect: {ce}"
+                    )
+
     async def _handle_message(
         self,
         ws: WebSocket,

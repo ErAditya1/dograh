@@ -117,6 +117,7 @@ class CallConcurrencyService:
             scope_max_concurrent = int(scope_max_concurrent)
 
         wait_start = time.time()
+        has_reconciled = False
         while True:
             acquisition = await rate_limiter.try_acquire_concurrent_slot_details(
                 organization_id,
@@ -138,6 +139,16 @@ class CallConcurrencyService:
                     source=source,
                     scope_key=scope_key,
                 )
+
+            # Self-healing check: if acquisition failed, check for and prune any zombie or abandoned slots
+            if not has_reconciled:
+                has_reconciled = True
+                pruned = await self.reconcile_org_slots(organization_id)
+                if pruned > 0:
+                    logger.info(
+                        f"Reclaimed {pruned} zombie slot(s) for org {organization_id}, retrying acquisition immediately"
+                    )
+                    continue
 
             wait_time = time.time() - wait_start
             if wait_time >= timeout:
@@ -301,6 +312,54 @@ class CallConcurrencyService:
                 "had no live slot; deleted stale mapping"
             )
         return released
+
+    async def reconcile_org_slots(self, organization_id: int) -> int:
+        """
+        Inspect and purge orphaned/zombie concurrency slots for an organization.
+        Reconciles:
+        1. Slots linked to workflow runs that have already finished (is_completed=True, state in ('completed', 'failed', 'cancelled')).
+        2. Unbound reservation slots older than 60 seconds (abandoned starts).
+        Returns count of reclaimed slots.
+        """
+        try:
+            slots = await rate_limiter.get_org_slots(organization_id)
+            if not slots:
+                return 0
+
+            reclaimed = 0
+            now = time.time()
+            for slot_id, score in slots:
+                workflow_run_id = await rate_limiter.get_slot_workflow_run_id(slot_id)
+                if workflow_run_id:
+                    try:
+                        run = await db_client.get_workflow_run_by_id(workflow_run_id)
+                        if run and (run.is_completed or run.state in ("completed", "failed", "cancelled")):
+                            logger.info(
+                                f"Reconciling zombie call slot {slot_id} for org {organization_id}: "
+                                f"workflow run {workflow_run_id} is already terminal (state={run.state})"
+                            )
+                            await self.release_workflow_run_slot(workflow_run_id)
+                            reclaimed += 1
+                    except Exception as re:
+                        logger.debug(f"Error checking workflow run {workflow_run_id} status: {re}")
+                else:
+                    # Unbound slot. If it was acquired > 60s ago, it is an abandoned reservation
+                    if (now - score) > 60:
+                        logger.info(
+                            f"Reconciling unbound abandoned slot {slot_id} for org {organization_id} "
+                            f"(age={now - score:.1f}s)"
+                        )
+                        await rate_limiter.release_concurrent_slot(organization_id, slot_id)
+                        reclaimed += 1
+
+            return reclaimed
+        except Exception as e:
+            logger.warning(f"Error reconciling concurrency slots for org {organization_id}: {e}")
+            return 0
+
+    async def reset_org_slots(self, organization_id: int) -> int:
+        """Manually purge all active concurrency slots for an organization."""
+        return await rate_limiter.reset_org_concurrency(organization_id)
 
 
 call_concurrency = CallConcurrencyService()

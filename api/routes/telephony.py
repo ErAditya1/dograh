@@ -147,25 +147,49 @@ async def initiate_call(
         provider = await get_telephony_provider_by_id(
             telephony_configuration_id, user.selected_organization_id
         )
-    except (OutboundSetupIncompleteError, OutboundConfigurationNotFoundError, ValueError):
+    except (OutboundSetupIncompleteError, OutboundConfigurationNotFoundError, ValueError) as first_err:
         # Attempt to auto-sync shared trial platform telephony for this organization
         try:
             from api.services.telephony.shared_trial_sync import sync_shared_trial_telephony_for_org
             if user.selected_organization_id:
                 await sync_shared_trial_telephony_for_org(user.selected_organization_id)
-            telephony_configuration_id = await resolve_outbound_configuration_id(
-                request.telephony_configuration_id,
-                user.selected_organization_id,
-                db=db_client,
-            )
+
+            # Try resolving the requested configuration again; if explicit config not found, fall back to org default
+            try:
+                telephony_configuration_id = await resolve_outbound_configuration_id(
+                    request.telephony_configuration_id,
+                    user.selected_organization_id,
+                    db=db_client,
+                )
+            except (OutboundConfigurationNotFoundError, ValueError):
+                telephony_configuration_id = await resolve_outbound_configuration_id(
+                    None,
+                    user.selected_organization_id,
+                    db=db_client,
+                )
+
             provider = await get_telephony_provider_by_id(
                 telephony_configuration_id, user.selected_organization_id
             )
+        except OutboundSetupIncompleteError as inc_err:
+            raise HTTPException(
+                status_code=400,
+                detail=inc_err.blocked_reason or str(inc_err),
+            ) from inc_err
+        except OutboundConfigurationNotFoundError as nf_err:
+            raise HTTPException(
+                status_code=400,
+                detail="telephony_not_configured",
+            ) from nf_err
         except Exception as retry_err:
             detail = (
-                "telephony_configuration_not_found"
-                if request.telephony_configuration_id is not None
-                else "telephony_not_configured"
+                str(retry_err)
+                if str(retry_err)
+                else (
+                    "telephony_configuration_not_found"
+                    if request.telephony_configuration_id is not None
+                    else "telephony_not_configured"
+                )
             )
             raise HTTPException(status_code=400, detail=detail) from retry_err
 
@@ -361,6 +385,22 @@ async def initiate_call(
     )
 
     return {"message": f"Call initiated successfully with run name {workflow_run_name}"}
+
+
+@router.post("/concurrency/reset")
+async def reset_telephony_concurrency(
+    user: UserModel = Depends(get_user),
+):
+    """Reset active concurrent call slots for the user's organization."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    freed = await call_concurrency.reset_org_slots(user.selected_organization_id)
+    logger.info(f"Reset telephony concurrency for org {user.selected_organization_id}: freed {freed} slots")
+    return {
+        "status": "success",
+        "message": f"Successfully reset telephony concurrency. Freed {freed} slot(s).",
+        "freed_slots": freed,
+    }
 
 
 async def _verify_organization_phone_number(

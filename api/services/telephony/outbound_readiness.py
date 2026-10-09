@@ -35,6 +35,30 @@ class OutboundSetupIncompleteError(OutboundReadinessError):
 async def _ensure_row_outbound_setup_ready(row: Any, *, db: Any) -> int:
     numbers = await db.list_phone_numbers_for_config(row.id)
     active_numbers = [number for number in numbers if number.is_active]
+
+    # Auto-sync Smartflo DID from credentials if no phone number row exists yet
+    if (
+        getattr(row, "provider", None) == "smartflo"
+        and getattr(row, "credentials", None)
+        and row.credentials.get("smartflo_did_number")
+        and not active_numbers
+        and hasattr(db, "create_phone_number")
+    ):
+        did_num = str(row.credentials["smartflo_did_number"]).strip()
+        if did_num:
+            try:
+                await db.create_phone_number(
+                    organization_id=row.organization_id,
+                    telephony_configuration_id=row.id,
+                    address=did_num,
+                    label="Smartflo Caller ID",
+                    is_active=True,
+                    is_default_caller_id=True,
+                )
+                numbers = await db.list_phone_numbers_for_config(row.id)
+                active_numbers = [number for number in numbers if number.is_active]
+            except Exception:
+                pass
     spec = registry.get_optional(row.provider)
     if spec is None:
         raise OutboundSetupIncompleteError(

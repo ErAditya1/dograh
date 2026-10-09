@@ -1,3 +1,4 @@
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -27,7 +28,10 @@ class RateLimiter:
 
     def __init__(self):
         self.redis_client: Optional[aioredis.Redis] = None
-        self.stale_call_timeout = 1200  # 20 minutes in seconds
+        # Default 300s (5 minutes) instead of 20 minutes, configurable via env
+        self.stale_call_timeout = max(
+            60, int(os.getenv("CONCURRENT_CALL_STALE_TIMEOUT_SECONDS", "300"))
+        )
 
     async def _get_redis(self) -> aioredis.Redis:
         """Get or create Redis connection"""
@@ -257,6 +261,7 @@ class RateLimiter:
             )
             if scope_key:
                 await redis_client.zrem(f"concurrent_calls:{scope_key}", slot_id)
+            await redis_client.delete(f"slot_workflow_mapping:{slot_id}")
             if removed:
                 logger.debug(
                     f"Released concurrent slot {slot_id} for org {organization_id}"
@@ -330,6 +335,9 @@ class RateLimiter:
             )
             # Set expiry to match stale timeout
             await redis_client.expire(mapping_key, self.stale_call_timeout)
+            await redis_client.set(
+                f"slot_workflow_mapping:{slot_id}", workflow_run_id, ex=self.stale_call_timeout
+            )
             return True
         except Exception as e:
             logger.error(f"Error storing workflow slot mapping: {e}")
@@ -379,6 +387,15 @@ class RateLimiter:
                 self.stale_call_timeout,
                 scope_key or "",
             )
+            if stored:
+                try:
+                    await redis_client.set(
+                        f"slot_workflow_mapping:{slot_id}",
+                        workflow_run_id,
+                        ex=self.stale_call_timeout,
+                    )
+                except Exception as ex:
+                    logger.debug(f"Error caching slot reverse mapping: {ex}")
             return bool(stored)
         except Exception as e:
             logger.error(f"Error storing workflow slot mapping if absent: {e}")
@@ -447,11 +464,60 @@ class RateLimiter:
         mapping_key = f"workflow_slot_mapping:{workflow_run_id}"
 
         try:
+            mapping = await redis_client.hgetall(mapping_key)
+            if mapping and "slot_id" in mapping:
+                await redis_client.delete(f"slot_workflow_mapping:{mapping['slot_id']}")
             deleted = await redis_client.delete(mapping_key)
             return bool(deleted)
         except Exception as e:
             logger.error(f"Error deleting workflow slot mapping: {e}")
             return False
+
+    async def get_slot_workflow_run_id(self, slot_id: str) -> Optional[int]:
+        """Get workflow_run_id associated with a slot_id."""
+        try:
+            redis_client = await self._get_redis()
+            val = await redis_client.get(f"slot_workflow_mapping:{slot_id}")
+            return int(val) if val else None
+        except Exception as e:
+            logger.error(f"Error getting slot workflow mapping: {e}")
+            return None
+
+    async def get_org_slots(self, organization_id: int) -> list[tuple[str, float]]:
+        """Get all currently tracked (slot_id, score_timestamp) pairs for an org."""
+        try:
+            redis_client = await self._get_redis()
+            concurrent_key = f"concurrent_calls:{organization_id}"
+            stale_cutoff = time.time() - self.stale_call_timeout
+            await redis_client.zremrangebyscore(concurrent_key, 0, stale_cutoff)
+            items = await redis_client.zrange(concurrent_key, 0, -1, withscores=True)
+            return [(str(slot), float(score)) for slot, score in items]
+        except Exception as e:
+            logger.error(f"Error getting org slots: {e}")
+            return []
+
+    async def reset_org_concurrency(self, organization_id: int) -> int:
+        """Purge all concurrency slots for an organization. Returns count of freed slots."""
+        try:
+            redis_client = await self._get_redis()
+            concurrent_key = f"concurrent_calls:{organization_id}"
+            slots = await redis_client.zrange(concurrent_key, 0, -1)
+            if not slots:
+                return 0
+            count = len(slots)
+            for slot_id in slots:
+                await redis_client.zrem(
+                    FLEET_CONCURRENT_KEY, f"{organization_id}:{slot_id}"
+                )
+                await redis_client.delete(f"slot_workflow_mapping:{slot_id}")
+            await redis_client.delete(concurrent_key)
+            logger.info(
+                f"Purged {count} concurrent call slots for org {organization_id}"
+            )
+            return count
+        except Exception as e:
+            logger.error(f"Error resetting org concurrency: {e}")
+            return 0
 
     async def select_from_number(
         self,

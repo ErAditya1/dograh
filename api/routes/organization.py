@@ -984,6 +984,20 @@ async def create_telephony_configuration(
             credentials=credentials,
             is_default_outbound=request.is_default_outbound,
         )
+        if request.config.provider == "smartflo" and credentials and credentials.get("smartflo_did_number"):
+            did_num = str(credentials["smartflo_did_number"]).strip()
+            if did_num:
+                try:
+                    await db_client.create_phone_number(
+                        organization_id=user.selected_organization_id,
+                        telephony_configuration_id=row.id,
+                        address=did_num,
+                        label="Smartflo Caller ID",
+                        is_active=True,
+                        is_default_caller_id=True,
+                    )
+                except Exception as ex:
+                    logger.warning(f"Could not auto-create phone number for Smartflo DID: {ex}")
     except TelephonyConfigurationConflictError as e:
         if "uq_telephony_configurations_org_name" in str(e):
             raise HTTPException(
@@ -1086,6 +1100,22 @@ async def update_telephony_configuration(
         name=request.name,
         credentials=credentials,
     )
+    if existing.provider == "smartflo" and credentials and credentials.get("smartflo_did_number"):
+        did_num = str(credentials["smartflo_did_number"]).strip()
+        if did_num:
+            existing_numbers = await db_client.list_phone_numbers_for_config(config_id)
+            if not any(n.address == did_num or n.address_normalized == did_num for n in existing_numbers):
+                try:
+                    await db_client.create_phone_number(
+                        organization_id=user.selected_organization_id,
+                        telephony_configuration_id=row.id,
+                        address=did_num,
+                        label="Smartflo Caller ID",
+                        is_active=True,
+                        is_default_caller_id=True,
+                    )
+                except Exception as ex:
+                    logger.warning(f"Could not auto-create phone number for Smartflo DID on update: {ex}")
 
     return await _detail_response(row)
 
