@@ -25,9 +25,10 @@ class TelephonyBillingService:
     async def get_org_claimed_numbers_count(self, organization_id: int) -> int:
         """Count how many platform inventory phone numbers this organization currently holds."""
         async with db_client.async_session() as session:
-            stmt = select(func.count(TelephonyPhoneNumberModel.id)).where(
-                TelephonyPhoneNumberModel.assigned_organization_id == organization_id,
+            stmt = select(func.count(func.distinct(TelephonyPhoneNumberModel.address_normalized))).where(
+                TelephonyPhoneNumberModel.organization_id == organization_id,
                 TelephonyPhoneNumberModel.is_platform_inventory == True,
+                TelephonyPhoneNumberModel.pool_type != "shared_trial",
                 TelephonyPhoneNumberModel.rental_status != "released",
             )
             res = await session.execute(stmt)
@@ -49,8 +50,19 @@ class TelephonyBillingService:
             if not num or not num.is_platform_inventory:
                 raise ValueError("Platform number not found")
 
-            if num.pool_type != "shared_trial" and num.assigned_organization_id is not None:
-                if num.assigned_organization_id != organization_id:
+            # Check if this specific organization has already claimed this number
+            stmt_existing = select(TelephonyPhoneNumberModel).where(
+                TelephonyPhoneNumberModel.organization_id == organization_id,
+                TelephonyPhoneNumberModel.address_normalized == num.address_normalized,
+                TelephonyPhoneNumberModel.is_active == True,
+            )
+            existing_claimed = (await session.execute(stmt_existing)).scalars().first()
+            if existing_claimed:
+                raise ValueError("This number has already been claimed by your organization")
+
+            # Dedicated numbers: only one organization can claim
+            if num.pool_type not in ("shared_trial", "shared_multi_org"):
+                if num.assigned_organization_id is not None and num.assigned_organization_id != organization_id:
                     raise ValueError("This number has already been claimed by another organization")
 
             # Determine rental pricing
@@ -77,10 +89,21 @@ class TelephonyBillingService:
                 await db_client.update_wallet_balance(organization_id, -rental_cost_charged_usd)
 
             # Mark platform inventory number assigned
-            num.assigned_organization_id = organization_id
-            num.claimed_at = now
-            num.next_rental_billing_at = now + timedelta(days=30)
-            num.rental_status = "active"
+            if num.pool_type not in ("shared_trial", "shared_multi_org"):
+                num.assigned_organization_id = organization_id
+                num.claimed_at = now
+                num.next_rental_billing_at = now + timedelta(days=30)
+                num.rental_status = "active"
+            elif num.pool_type == "shared_multi_org":
+                meta = dict(num.extra_metadata or {})
+                claimed_orgs = list(meta.get("claimed_org_ids", []))
+                if organization_id not in claimed_orgs:
+                    claimed_orgs.append(organization_id)
+                    meta["claimed_org_ids"] = claimed_orgs
+                    num.extra_metadata = meta
+                if num.assigned_organization_id is None:
+                    num.assigned_organization_id = organization_id
+                num.rental_status = "active"
 
             # Find source configuration
             source_config = await session.get(
@@ -131,6 +154,10 @@ class TelephonyBillingService:
                 TelephonyPhoneNumberModel.address_normalized == num.address_normalized,
             )
             org_num = (await session.execute(stmt_num)).scalar_one_or_none()
+            org_meta = dict(num.extra_metadata or {})
+            org_meta["is_claimed_platform_number"] = True
+            org_meta["source_platform_number_id"] = num.id
+
             if not org_num:
                 org_num = TelephonyPhoneNumberModel(
                     organization_id=organization_id,
@@ -143,26 +170,28 @@ class TelephonyBillingService:
                     is_active=True,
                     is_default_caller_id=set_as_default,
                     pool_type=num.pool_type,
-                    is_platform_inventory=True,
+                    is_platform_inventory=False,
                     claimed_at=now,
                     next_rental_billing_at=now + timedelta(days=30),
                     rental_status="active",
-                    extra_metadata=dict(num.extra_metadata or {}),
+                    extra_metadata=org_meta,
                 )
                 session.add(org_num)
             else:
                 org_num.telephony_configuration_id = existing_org_config.id
                 org_num.is_active = True
-                org_num.is_platform_inventory = True
+                org_num.is_platform_inventory = False
                 org_num.rental_status = "active"
+                org_num.pool_type = num.pool_type
+                org_num.claimed_at = now
                 org_num.next_rental_billing_at = now + timedelta(days=30)
-                if num.extra_metadata:
-                    org_num.extra_metadata = dict(num.extra_metadata or {})
+                org_num.extra_metadata = org_meta
                 if set_as_default:
                     org_num.is_default_caller_id = True
 
+            await session.flush()
             claimed_address = str(num.address)
-            num_id = int(num.id)
+            num_id = int(org_num.id)
             config_id = int(existing_org_config.id)
 
             await session.commit()
@@ -261,16 +290,45 @@ class TelephonyBillingService:
         """Explicitly unclaim/release a platform number from an organization."""
         async with db_client.async_session() as session:
             num = await session.get(TelephonyPhoneNumberModel, phone_number_id)
-            if not num or not num.is_platform_inventory:
-                raise ValueError("Platform number not found")
-            if num.assigned_organization_id != organization_id:
-                raise ValueError("Number does not belong to this organization")
+            if not num:
+                raise ValueError("Phone number not found")
 
-            num.assigned_organization_id = None
-            num.rental_status = "available"
-            num.next_rental_billing_at = None
+            # Resolve to the master inventory record
+            master_num = num
+            if not num.is_platform_inventory or (num.configuration and num.configuration.name.startswith("Platform - ")):
+                stmt_master = (
+                    select(TelephonyPhoneNumberModel)
+                    .join(
+                        TelephonyConfigurationModel,
+                        TelephonyPhoneNumberModel.telephony_configuration_id == TelephonyConfigurationModel.id,
+                    )
+                    .where(
+                        TelephonyPhoneNumberModel.address_normalized == num.address_normalized,
+                        TelephonyPhoneNumberModel.is_platform_inventory == True,
+                        ~TelephonyConfigurationModel.name.like("Platform - %"),
+                    )
+                )
+                master_num = (await session.execute(stmt_master)).scalars().first()
 
-            # Also deactivate cloned number in org
+            if master_num:
+                if master_num.pool_type == "shared_multi_org":
+                    meta = dict(master_num.extra_metadata or {})
+                    claimed_orgs = list(meta.get("claimed_org_ids", []))
+                    if organization_id in claimed_orgs:
+                        claimed_orgs.remove(organization_id)
+                        meta["claimed_org_ids"] = claimed_orgs
+                        master_num.extra_metadata = meta
+                    if master_num.assigned_organization_id == organization_id:
+                        master_num.assigned_organization_id = claimed_orgs[0] if claimed_orgs else None
+                    if not claimed_orgs:
+                        master_num.rental_status = "available"
+                elif master_num.pool_type != "shared_trial":
+                    if master_num.assigned_organization_id == organization_id:
+                        master_num.assigned_organization_id = None
+                        master_num.rental_status = "available"
+                        master_num.next_rental_billing_at = None
+
+            # Deactivate cloned number in tenant organization
             stmt_clone = (
                 update(TelephonyPhoneNumberModel)
                 .where(

@@ -934,6 +934,17 @@ async def list_telephony_configurations(user: UserModel = Depends(get_user)):
                 [n for n in active if n.telephony_trunk_id is None]
             ),
         )
+        is_platform = (
+            bool(getattr(row, "is_platform_inventory", False))
+            or (bool(row.name) and row.name.startswith("Platform - "))
+            or any(getattr(n, "is_platform_inventory", False) for n in active)
+        )
+        is_claimed_cfg = is_platform or any(
+            getattr(n, "claimed_at", None) is not None
+            or getattr(n, "rental_status", None) == "active"
+            or getattr(n, "pool_type", None) in ("shared_trial", "shared_multi_org", "dedicated")
+            for n in active
+        )
         is_shared = (
             (bool(row.name) and row.name.startswith("Platform - "))
             or (len(active) > 0 and any(getattr(n, "pool_type", None) == "shared_trial" for n in active))
@@ -957,6 +968,8 @@ async def list_telephony_configurations(user: UserModel = Depends(get_user)):
                     checklist.outbound_blocked_reason if checklist else None
                 ),
                 is_shared_trial=is_shared,
+                is_platform_inventory=is_platform,
+                is_claimed=is_claimed_cfg,
                 created_at=row.created_at,
                 updated_at=row.updated_at,
             )
@@ -1058,6 +1071,12 @@ async def update_telephony_configuration(
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Telephony configuration not found")
+
+    if bool(getattr(existing, "is_platform_inventory", False)) or (bool(existing.name) and existing.name.startswith("Platform - ")):
+        raise HTTPException(
+            status_code=403,
+            detail="Claimed platform configurations are managed by the platform and cannot be modified. They are not Bring-Your-Own (BYO) carrier accounts.",
+        )
 
     credentials = None
     if request.config is not None:
@@ -1173,6 +1192,18 @@ async def delete_telephony_configuration(
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
+    existing = await db_client.get_telephony_configuration_for_org(
+        config_id, user.selected_organization_id, active_only=False
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Telephony configuration not found")
+
+    if bool(getattr(existing, "is_platform_inventory", False)) or (bool(existing.name) and existing.name.startswith("Platform - ")):
+        raise HTTPException(
+            status_code=403,
+            detail="Claimed platform configurations cannot be deleted directly. Please release the claimed phone number from the Platform Numbers section.",
+        )
+
     try:
         deleted = await db_client.delete_telephony_configuration(
             config_id, user.selected_organization_id
@@ -1186,10 +1217,26 @@ async def delete_telephony_configuration(
 
 
 async def _detail_response(row) -> TelephonyConfigurationDetail:
-    masked = _credentials_for_display(row.provider, row.credentials or {})
     numbers = await db_client.list_phone_numbers_for_config(row.id)
     active = [n for n in numbers if n.is_active]
-    trunks = await _list_trunks_if_supported(row.provider, row.id)
+    is_platform = (
+        bool(getattr(row, "is_platform_inventory", False))
+        or (bool(row.name) and row.name.startswith("Platform - "))
+        or any(getattr(n, "is_platform_inventory", False) for n in active)
+    )
+    is_claimed_cfg = is_platform or any(
+        getattr(n, "claimed_at", None) is not None
+        or getattr(n, "rental_status", None) == "active"
+        or getattr(n, "pool_type", None) in ("shared_trial", "shared_multi_org", "dedicated")
+        for n in active
+    )
+    is_shared = (
+        (bool(row.name) and row.name.startswith("Platform - "))
+        or (len(active) > 0 and any(getattr(n, "pool_type", None) == "shared_trial" for n in active))
+        or getattr(row, "is_platform_inventory", False)
+    )
+    masked = _credentials_for_display(row.provider, row.credentials or {})
+    trunks = [] if is_platform else await _list_trunks_if_supported(row.provider, row.id)
     numbers_per_trunk: dict[int, int] = {}
     for number in numbers:
         if number.telephony_trunk_id is not None:
@@ -1206,12 +1253,12 @@ async def _detail_response(row) -> TelephonyConfigurationDetail:
         inactive_since=row.inactive_since,
         inactive_reason=row.inactive_reason,
         credentials=masked,
-        sip_connectivity=get_sip_connectivity_details(
+        sip_connectivity=None if is_platform else get_sip_connectivity_details(
             row.provider, row.credentials or {}
         ),
         # Built from the stored (unmasked) credentials: the checklist reports
         # whether a field is set, never what it is.
-        setup_checklist=get_setup_checklist(
+        setup_checklist=None if is_platform else get_setup_checklist(
             row.provider,
             row.credentials or {},
             active_phone_number_count=len(active),
@@ -1223,11 +1270,14 @@ async def _detail_response(row) -> TelephonyConfigurationDetail:
                 [n for n in active if n.telephony_trunk_id is None]
             ),
         ),
-        supports_trunks=_provider_supports_trunks(row.provider),
-        trunks=[
+        supports_trunks=False if is_platform else _provider_supports_trunks(row.provider),
+        trunks=[] if is_platform else [
             _trunk_to_response(trunk, numbers_per_trunk.get(trunk.id, 0))
             for trunk in trunks
         ],
+        is_shared_trial=is_shared,
+        is_platform_inventory=is_platform,
+        is_claimed=is_claimed_cfg,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -1327,6 +1377,11 @@ async def create_telephony_trunk(
         raise HTTPException(status_code=400, detail="No organization selected")
 
     cfg = await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
+    if bool(getattr(cfg, "is_platform_inventory", False)) or (bool(cfg.name) and cfg.name.startswith("Platform - ")):
+        raise HTTPException(
+            status_code=403,
+            detail="Trunks cannot be added to a claimed platform configuration.",
+        )
     spec = _require_trunk_support(cfg.provider)
     settings = _validated_trunk_settings(spec, request.settings)
     name = request.name.strip()
@@ -1520,6 +1575,11 @@ async def create_phone_number(
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
     cfg = await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
+    if bool(getattr(cfg, "is_platform_inventory", False)) or (bool(cfg.name) and cfg.name.startswith("Platform - ")):
+        raise HTTPException(
+            status_code=403,
+            detail="Cannot manually add phone numbers to a claimed platform configuration. Numbers are claimed from Platform Numbers.",
+        )
 
     if request.inbound_workflow_id is not None:
         await _ensure_workflow_belongs_to_org(
@@ -1687,6 +1747,12 @@ async def delete_phone_number(
     existing = await db_client.get_phone_number_for_config(phone_number_id, config_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Phone number not found")
+
+    if bool(getattr(existing, "is_platform_inventory", False)):
+        raise HTTPException(
+            status_code=403,
+            detail="Claimed platform numbers cannot be deleted here. Please release the number from the Platform Numbers section.",
+        )
 
     provider_sync = await _sync_inbound_for_phone_number(
         config_id,

@@ -113,6 +113,8 @@ class TelephonyConfigurationListItem(BaseModel):
     is_ready_for_outbound: bool = True
     outbound_blocked_reason: str | None = None
     is_shared_trial: bool = False
+    is_platform_inventory: bool = False
+    is_claimed: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -176,6 +178,9 @@ class TelephonyConfigurationDetail(BaseModel):
     # Empty unless the provider's Dograh integration models trunks; the
     # call-control integrations route through the account itself.
     trunks: List[TrunkResponse] = Field(default_factory=list)
+    is_shared_trial: bool = False
+    is_platform_inventory: bool = False
+    is_claimed: bool = False
     created_at: datetime
     updated_at: datetime
 

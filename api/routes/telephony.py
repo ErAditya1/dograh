@@ -20,7 +20,11 @@ from pydantic import BaseModel
 from starlette.websockets import WebSocketDisconnect
 
 from api.db import db_client
-from api.db.models import UserModel
+from api.db.models import (
+    TelephonyConfigurationModel,
+    TelephonyPhoneNumberModel,
+    UserModel,
+)
 from api.enums import CallType, WorkflowRunMode, WorkflowRunState
 from api.errors.failure import failure_already_reported
 from api.errors.telephony_errors import TelephonyError
@@ -138,9 +142,53 @@ async def initiate_call(
     # Resolve and pre-flight the explicit config, or select the first active
     # config that is ready for outbound. This happens before run creation so a
     # setup problem does not land in run history as a failed call.
+    target_config_id = request.telephony_configuration_id
+    if request.from_phone_number_id is not None:
+        pn_lookup = await db_client.get_phone_number(request.from_phone_number_id)
+        if pn_lookup and pn_lookup.is_active:
+            if not user.selected_organization_id or pn_lookup.organization_id == user.selected_organization_id:
+                if target_config_id is None:
+                    target_config_id = pn_lookup.telephony_configuration_id
+            elif pn_lookup.is_platform_inventory or pn_lookup.pool_type in ("shared_trial", "shared_multi_org") or getattr(pn_lookup, "assigned_organization_id", None) == user.selected_organization_id:
+                try:
+                    from api.services.telephony.shared_trial_sync import sync_shared_trial_telephony_for_org
+                    if user.selected_organization_id:
+                        await sync_shared_trial_telephony_for_org(user.selected_organization_id)
+                    async with db_client.async_session() as session:
+                        stmt = select(TelephonyPhoneNumberModel).where(
+                            TelephonyPhoneNumberModel.organization_id == user.selected_organization_id,
+                            TelephonyPhoneNumberModel.address_normalized == pn_lookup.address_normalized,
+                            TelephonyPhoneNumberModel.is_active == True,
+                        )
+                        org_clone = (await session.execute(stmt)).scalars().first()
+                        if org_clone:
+                            request.from_phone_number_id = org_clone.id
+                            target_config_id = org_clone.telephony_configuration_id
+                except Exception as map_err:
+                    logger.debug(f"Error mapping platform number in initiate_call: {map_err}")
+
+    if target_config_id is not None and user.selected_organization_id:
+        try:
+            async with db_client.async_session() as session:
+                cfg_row = await session.get(TelephonyConfigurationModel, target_config_id)
+                if cfg_row and cfg_row.organization_id != user.selected_organization_id:
+                    if cfg_row.is_platform_inventory or (cfg_row.name and cfg_row.name.startswith("Platform -")):
+                        from api.services.telephony.shared_trial_sync import sync_shared_trial_telephony_for_org
+                        await sync_shared_trial_telephony_for_org(user.selected_organization_id)
+                        stmt = select(TelephonyConfigurationModel).where(
+                            TelephonyConfigurationModel.organization_id == user.selected_organization_id,
+                            TelephonyConfigurationModel.name == f"Platform - {cfg_row.name}",
+                            TelephonyConfigurationModel.inactive == False,
+                        )
+                        cloned_cfg = (await session.execute(stmt)).scalars().first()
+                        if cloned_cfg:
+                            target_config_id = cloned_cfg.id
+        except Exception as cfg_map_err:
+            logger.debug(f"Error mapping platform config in initiate_call: {cfg_map_err}")
+
     try:
         telephony_configuration_id = await resolve_outbound_configuration_id(
-            request.telephony_configuration_id,
+            target_config_id,
             user.selected_organization_id,
             db=db_client,
         )
@@ -157,7 +205,7 @@ async def initiate_call(
             # Try resolving the requested configuration again; if explicit config not found, fall back to org default
             try:
                 telephony_configuration_id = await resolve_outbound_configuration_id(
-                    request.telephony_configuration_id,
+                    target_config_id,
                     user.selected_organization_id,
                     db=db_client,
                 )
@@ -233,6 +281,27 @@ async def initiate_call(
         phone_row = await db_client.get_phone_number_for_config(
             request.from_phone_number_id, telephony_configuration_id
         )
+        if not phone_row:
+            # Check if phone number exists for the organization or is platform inventory
+            direct_pn = await db_client.get_phone_number(request.from_phone_number_id)
+            if direct_pn and direct_pn.is_active:
+                if not user.selected_organization_id or direct_pn.organization_id == user.selected_organization_id:
+                    phone_row = direct_pn
+                elif direct_pn.is_platform_inventory or direct_pn.pool_type in ("shared_trial", "shared_multi_org"):
+                    async with db_client.async_session() as session:
+                        stmt = select(TelephonyPhoneNumberModel).where(
+                            TelephonyPhoneNumberModel.organization_id == user.selected_organization_id,
+                            TelephonyPhoneNumberModel.address_normalized == direct_pn.address_normalized,
+                            TelephonyPhoneNumberModel.is_active == True,
+                        )
+                        phone_row = (await session.execute(stmt)).scalars().first()
+                    if not phone_row:
+                        phone_row = direct_pn
+                if phone_row and telephony_configuration_id != phone_row.telephony_configuration_id:
+                    telephony_configuration_id = phone_row.telephony_configuration_id
+                    provider = await get_telephony_provider_by_id(
+                        telephony_configuration_id, user.selected_organization_id
+                    )
         if not phone_row or not phone_row.is_active:
             raise HTTPException(status_code=400, detail="from_phone_number_not_found")
         from_number = phone_row.address_normalized

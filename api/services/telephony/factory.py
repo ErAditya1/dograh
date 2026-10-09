@@ -63,10 +63,19 @@ async def load_telephony_config_by_id(
         resolved_cfg_id, organization_id, active_only=True
     )
     if not row:
-        raise ValueError(
-            f"Telephony configuration {resolved_cfg_id} not found "
-            f"for organization {organization_id}"
-        )
+        # Allow platform inventory configurations to be loaded for tenant calls
+        platform_cfg = await db_client.get_telephony_configuration(resolved_cfg_id)
+        if (
+            platform_cfg
+            and getattr(platform_cfg, "is_platform_inventory", False)
+            and not getattr(platform_cfg, "inactive", False)
+        ):
+            row = platform_cfg
+        else:
+            raise ValueError(
+                f"Telephony configuration {resolved_cfg_id} not found "
+                f"for organization {organization_id}"
+            )
     if getattr(row, "inactive", False):
         raise ValueError(
             f"Telephony configuration {resolved_cfg_id} is inactive "

@@ -47,6 +47,23 @@ async def save_smartflo_call_state(
     if customer_number:
         clean_num = str(customer_number).strip().lstrip("+")
         keys.add(f"smartflo:call:phone:{clean_num}")
+        keys.add(f"smartflo:call:{clean_num}")
+        if len(clean_num) == 12 and clean_num.startswith("91"):
+            keys.add(f"smartflo:call:phone:{clean_num[2:]}")
+            keys.add(f"smartflo:call:{clean_num[2:]}")
+            keys.add(f"smartflo:call:phone:0{clean_num[2:]}")
+            keys.add(f"smartflo:call:0{clean_num[2:]}")
+        elif len(clean_num) == 10:
+            keys.add(f"smartflo:call:phone:91{clean_num}")
+            keys.add(f"smartflo:call:91{clean_num}")
+            keys.add(f"smartflo:call:phone:0{clean_num}")
+            keys.add(f"smartflo:call:0{clean_num}")
+
+    run_id = state.get("workflow_run_id")
+    if run_id:
+        keys.add(f"smartflo:call:run:{run_id}")
+        keys.add(f"smartflo:call:{run_id}")
+        keys.add(f"smartflo:call:custom:{run_id}")
 
     for k in keys:
         try:
@@ -59,7 +76,7 @@ async def save_smartflo_call_state(
 
 
 async def get_smartflo_call_state(identifier: str) -> Optional[Dict[str, Any]]:
-    """Retrieve call state by ref_id, call_id, or phone number."""
+    """Retrieve call state by ref_id, call_id, phone number, or run ID."""
     if not identifier:
         return None
     client = get_redis_client()
@@ -69,8 +86,22 @@ async def get_smartflo_call_state(identifier: str) -> Optional[Dict[str, Any]]:
         f"smartflo:call:{clean_id}",
         f"smartflo:call:ref:{clean_id}",
         f"smartflo:call:id:{clean_id}",
+        f"smartflo:call:run:{clean_id}",
+        f"smartflo:call:custom:{clean_id}",
         f"smartflo:call:phone:{clean_id}",
     ]
+    if len(clean_id) == 12 and clean_id.startswith("91"):
+        candidate_keys.extend([
+            f"smartflo:call:{clean_id[2:]}",
+            f"smartflo:call:phone:{clean_id[2:]}",
+            f"smartflo:call:0{clean_id[2:]}",
+        ])
+    elif len(clean_id) == 10:
+        candidate_keys.extend([
+            f"smartflo:call:91{clean_id}",
+            f"smartflo:call:phone:91{clean_id}",
+            f"smartflo:call:0{clean_id}",
+        ])
 
     for k in candidate_keys:
         try:

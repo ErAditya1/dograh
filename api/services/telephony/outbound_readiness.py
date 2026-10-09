@@ -106,10 +106,18 @@ async def ensure_outbound_setup_ready(
         active_only=True,
     )
     if row is None:
-        raise OutboundConfigurationNotFoundError(
-            f"Telephony configuration {telephony_configuration_id} not found "
-            f"for organization {organization_id}"
-        )
+        platform_cfg = await db.get_telephony_configuration(telephony_configuration_id)
+        if (
+            platform_cfg
+            and getattr(platform_cfg, "is_platform_inventory", False)
+            and not getattr(platform_cfg, "inactive", False)
+        ):
+            row = platform_cfg
+        else:
+            raise OutboundConfigurationNotFoundError(
+                f"Telephony configuration {telephony_configuration_id} not found "
+                f"for organization {organization_id}"
+            )
     return await _ensure_row_outbound_setup_ready(row, db=db)
 
 

@@ -25,6 +25,18 @@ async def list_platform_numbers(
     return numbers
 
 
+@router.get("/claimed", response_model=List[Dict[str, Any]])
+async def list_claimed_platform_numbers(
+    user: UserModel = Depends(get_user),
+):
+    """List all platform numbers claimed by the organization."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+
+    numbers = await db_client.list_claimed_phone_numbers_for_org(user.selected_organization_id)
+    return numbers
+
+
 @router.post("/{number_id}/claim")
 async def claim_platform_number(
     number_id: int,

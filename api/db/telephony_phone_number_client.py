@@ -452,18 +452,34 @@ class TelephonyPhoneNumberClient(BaseDBClient):
     ) -> List[Dict[str, Any]]:
         """List platform inventory numbers visible to an organization.
 
-        Shared trial numbers are visible to everyone.
+        Only master inventory items stocked by superadmin are returned (deduplicated).
+        Shared trial numbers are visible and free.
+        Multi-org shared numbers can be claimed by multiple organizations.
         Dedicated numbers are visible if unassigned OR if assigned to this organization.
         """
         async with self.async_session() as session:
             # 1. Check all numbers currently claimed / active in this organization's workspace
-            claimed_addresses_stmt = select(TelephonyPhoneNumberModel.address_normalized).where(
-                TelephonyPhoneNumberModel.organization_id == organization_id,
-                TelephonyPhoneNumberModel.is_active == True,
+            org_numbers_stmt = (
+                select(
+                    TelephonyPhoneNumberModel.address_normalized,
+                    TelephonyPhoneNumberModel.id,
+                    TelephonyPhoneNumberModel.telephony_configuration_id,
+                )
+                .join(
+                    TelephonyConfigurationModel,
+                    TelephonyPhoneNumberModel.telephony_configuration_id == TelephonyConfigurationModel.id,
+                )
+                .where(
+                    TelephonyPhoneNumberModel.organization_id == organization_id,
+                    TelephonyPhoneNumberModel.is_active == True,
+                )
             )
-            claimed_addresses = set((await session.execute(claimed_addresses_stmt)).scalars().all())
+            org_number_rows = (await session.execute(org_numbers_stmt)).all()
+            org_numbers_map = {row[0]: (row[1], row[2]) for row in org_number_rows}
+            claimed_addresses = set(org_numbers_map.keys())
 
-            # 2. Select platform inventory numbers
+            # 2. Select ONLY Master platform inventory numbers (stocked by Superadmin)
+            # Cloned tenant configurations start with "Platform - "; master configurations do not.
             stmt = (
                 select(TelephonyPhoneNumberModel, TelephonyConfigurationModel)
                 .join(
@@ -474,6 +490,7 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                 .where(
                     TelephonyPhoneNumberModel.is_platform_inventory == True,
                     TelephonyPhoneNumberModel.is_active == True,
+                    ~TelephonyConfigurationModel.name.like("Platform - %"),
                 )
                 .order_by(
                     TelephonyPhoneNumberModel.pool_type.desc(),
@@ -483,28 +500,44 @@ class TelephonyPhoneNumberClient(BaseDBClient):
             result = await session.execute(stmt)
             rows = result.all()
 
+            seen_addresses = set()
             output = []
             for num, config in rows:
+                if num.address_normalized in seen_addresses:
+                    continue
+                seen_addresses.add(num.address_normalized)
+
                 is_shared_trial = num.pool_type == "shared_trial"
                 is_shared_multi_org = num.pool_type == "shared_multi_org"
+                is_dedicated = num.pool_type == "dedicated" or (not is_shared_trial and not is_shared_multi_org)
+
+                meta = num.extra_metadata or {}
+                claimed_orgs = meta.get("claimed_org_ids", [])
 
                 # Check if this specific organization has claimed this number
                 is_claimed_by_you = (
                     num.address_normalized in claimed_addresses
-                    or num.assigned_organization_id == organization_id
-                    or is_shared_trial
+                    or (is_shared_multi_org and organization_id in claimed_orgs)
+                    or (is_dedicated and num.assigned_organization_id == organization_id)
                 )
 
                 # Dedicated numbers assigned to another organization
-                is_assigned_to_other = (
-                    not is_shared_trial
-                    and not is_shared_multi_org
+                is_taken_by_other = (
+                    is_dedicated
                     and num.assigned_organization_id is not None
                     and num.assigned_organization_id != organization_id
                 )
 
-                if is_assigned_to_other:
-                    continue
+                # Can this organization claim this number?
+                if is_claimed_by_you:
+                    can_claim = False
+                    claim_disabled_reason = "Already claimed by your workspace"
+                elif is_taken_by_other:
+                    can_claim = False
+                    claim_disabled_reason = "Dedicated number claimed by another organization"
+                else:
+                    can_claim = True
+                    claim_disabled_reason = None
 
                 output.append(
                     {
@@ -513,16 +546,21 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                         "carrier": config.provider,
                         "pool_type": num.pool_type,
                         "monthly_price_cents": num.monthly_price_cents,
-                        "in_use": is_claimed_by_you if is_shared_multi_org else (not is_shared_trial and (num.assigned_organization_id is not None)),
+                        "in_use": is_taken_by_other or (is_dedicated and is_claimed_by_you),
                         "is_claimed_by_you": is_claimed_by_you,
+                        "can_claim": can_claim,
+                        "claim_disabled_reason": claim_disabled_reason,
                         "country_code": num.country_code,
-                        "telephony_configuration_id": num.telephony_configuration_id,
+                        "telephony_configuration_id": config.id,
                     }
                 )
             return output
 
     async def list_all_platform_inventory(self) -> List[Dict[str, Any]]:
-        """List all platform inventory numbers for superadmin view."""
+        """List all platform inventory numbers for superadmin view.
+
+        Returns only master inventory stock items (deduplicated), not tenant copies.
+        """
         async with self.async_session() as session:
             stmt = (
                 select(TelephonyPhoneNumberModel, TelephonyConfigurationModel)
@@ -531,7 +569,10 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                     TelephonyPhoneNumberModel.telephony_configuration_id
                     == TelephonyConfigurationModel.id,
                 )
-                .where(TelephonyPhoneNumberModel.is_platform_inventory == True)
+                .where(
+                    TelephonyPhoneNumberModel.is_platform_inventory == True,
+                    ~TelephonyConfigurationModel.name.like("Platform - %"),
+                )
                 .order_by(TelephonyPhoneNumberModel.created_at.desc())
             )
             result = await session.execute(stmt)
@@ -541,33 +582,104 @@ class TelephonyPhoneNumberClient(BaseDBClient):
             claimed_counts_stmt = (
                 select(
                     TelephonyPhoneNumberModel.address_normalized,
-                    func.count(TelephonyPhoneNumberModel.id).label("claim_count")
+                    func.count(func.distinct(TelephonyPhoneNumberModel.organization_id)).label("claim_count")
+                )
+                .join(
+                    TelephonyConfigurationModel,
+                    TelephonyPhoneNumberModel.telephony_configuration_id == TelephonyConfigurationModel.id
                 )
                 .where(
-                    TelephonyPhoneNumberModel.is_platform_inventory == False,
+                    TelephonyConfigurationModel.name.like("Platform - %"),
                     TelephonyPhoneNumberModel.is_active == True,
                 )
                 .group_by(TelephonyPhoneNumberModel.address_normalized)
             )
             claimed_counts = dict((await session.execute(claimed_counts_stmt)).all())
 
-            return [
-                {
-                    "id": num.id,
-                    "phone_number": num.address,
-                    "carrier": config.provider,
-                    "configuration_id": config.id,
-                    "configuration_name": config.name,
-                    "pool_type": num.pool_type,
-                    "monthly_price_cents": num.monthly_price_cents,
-                    "assigned_organization_id": num.assigned_organization_id,
-                    "claimed_count": claimed_counts.get(num.address_normalized, 1 if num.assigned_organization_id else 0),
-                    "is_active": num.is_active,
-                    "extra_metadata": num.extra_metadata or {},
-                    "created_at": num.created_at.isoformat() if num.created_at else None,
-                }
-                for num, config in rows
-            ]
+            seen_addresses = set()
+            output = []
+            for num, config in rows:
+                if num.address_normalized in seen_addresses:
+                    continue
+                seen_addresses.add(num.address_normalized)
+
+                actual_claimed_count = claimed_counts.get(num.address_normalized, 0)
+                if num.pool_type == "dedicated":
+                    actual_claimed_count = 1 if num.assigned_organization_id else 0
+                elif num.pool_type == "shared_multi_org":
+                    meta_orgs = (num.extra_metadata or {}).get("claimed_org_ids", [])
+                    actual_claimed_count = max(actual_claimed_count, len(meta_orgs))
+
+                output.append(
+                    {
+                        "id": num.id,
+                        "phone_number": num.address,
+                        "carrier": config.provider,
+                        "configuration_id": config.id,
+                        "configuration_name": config.name,
+                        "pool_type": num.pool_type,
+                        "monthly_price_cents": num.monthly_price_cents,
+                        "assigned_organization_id": num.assigned_organization_id,
+                        "claimed_count": actual_claimed_count,
+                        "is_active": num.is_active,
+                        "extra_metadata": num.extra_metadata or {},
+                        "created_at": num.created_at.isoformat() if num.created_at else None,
+                    }
+                )
+            return output
+
+    async def list_claimed_phone_numbers_for_org(
+        self, organization_id: int
+    ) -> List[Dict[str, Any]]:
+        """List all platform numbers claimed by a specific organization."""
+        async with self.async_session() as session:
+            stmt = (
+                select(TelephonyPhoneNumberModel, TelephonyConfigurationModel, WorkflowModel.name)
+                .join(
+                    TelephonyConfigurationModel,
+                    TelephonyPhoneNumberModel.telephony_configuration_id == TelephonyConfigurationModel.id,
+                )
+                .join(
+                    WorkflowModel,
+                    WorkflowModel.id == TelephonyPhoneNumberModel.inbound_workflow_id,
+                    isouter=True,
+                )
+                .where(
+                    TelephonyPhoneNumberModel.organization_id == organization_id,
+                    TelephonyPhoneNumberModel.is_active == True,
+                    TelephonyConfigurationModel.name.like("Platform - %"),
+                )
+                .order_by(TelephonyPhoneNumberModel.created_at.desc())
+            )
+            result = await session.execute(stmt)
+            rows = result.all()
+
+            output = []
+            for num, config, workflow_name in rows:
+                output.append(
+                    {
+                        "id": num.id,
+                        "phone_number": num.address,
+                        "address_normalized": num.address_normalized,
+                        "country_code": num.country_code,
+                        "label": num.label,
+                        "carrier": config.provider,
+                        "telephony_configuration_id": config.id,
+                        "telephony_configuration_name": config.name,
+                        "pool_type": num.pool_type,
+                        "monthly_price_cents": num.monthly_price_cents,
+                        "is_default_caller_id": num.is_default_caller_id,
+                        "is_default_outbound": config.is_default_outbound,
+                        "inbound_workflow_id": num.inbound_workflow_id,
+                        "inbound_workflow_name": workflow_name,
+                        "claimed_at": num.claimed_at.isoformat() if num.claimed_at else None,
+                        "rental_status": num.rental_status,
+                        "next_rental_billing_at": num.next_rental_billing_at.isoformat() if num.next_rental_billing_at else None,
+                        "is_platform_inventory": True,
+                        "is_claimed": True,
+                    }
+                )
+            return output
 
     async def claim_platform_number(
         self,

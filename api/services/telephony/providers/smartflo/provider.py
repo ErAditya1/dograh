@@ -99,8 +99,15 @@ class SmartfloProvider(TelephonyProvider):
         clean_did = clean_num(did)
         clean_from = clean_num(from_number)
         
-        # Priority for caller_id: use explicitly selected from_number if present, else fallback to configured DID
-        caller_id = clean_from if clean_from else clean_did
+        # Smartflo strictly requires an authorized Smartflo virtual DID as caller_id.
+        # If clean_from is provided and matches clean_did (or clean_did is empty), use clean_from.
+        # Otherwise, prefer clean_did (the verified Smartflo virtual number) to prevent 422 errors.
+        if clean_from and (not clean_did or clean_from.endswith(clean_did) or clean_did.endswith(clean_from)):
+            caller_id = clean_from
+        elif clean_did:
+            caller_id = clean_did
+        else:
+            caller_id = clean_from
 
         # Safe logging - NEVER log credentials or raw tokens
         logger.info(
@@ -144,19 +151,28 @@ class SmartfloProvider(TelephonyProvider):
             # e.g., 10-digit (8065254733), 12-digit with 91 (918065254733), or 11-digit with 0 (08065254733)
             if response.status_code == 422 and "caller_id" in response.text:
                 candidates = []
-                if len(caller_id) == 12 and caller_id.startswith("91"):
-                    candidates.append(caller_id[2:])        # 10-digit
-                    candidates.append(f"0{caller_id[2:]}")  # 11-digit
-                elif len(caller_id) == 10:
-                    candidates.append(f"91{caller_id}")     # 12-digit with 91
-                    candidates.append(f"0{caller_id}")      # 11-digit with 0
-                elif len(caller_id) == 11 and caller_id.startswith("0"):
-                    candidates.append(caller_id[1:])        # 10-digit
-                    candidates.append(f"91{caller_id[1:]}") # 12-digit
+                seen_candidates = set()
 
-                # Also test clean_from if clean_did was used and differed
-                if clean_from and clean_from != caller_id and clean_from not in candidates:
-                    candidates.append(clean_from)
+                def add_candidate(val: str):
+                    if val and val not in seen_candidates and val != caller_id:
+                        seen_candidates.add(val)
+                        candidates.append(val)
+
+                # Prioritize the verified Smartflo DID, then clean_from
+                base_numbers = [clean_did, caller_id, clean_from] if clean_did else [caller_id, clean_from]
+                for base in base_numbers:
+                    if not base:
+                        continue
+                    add_candidate(base)
+                    if len(base) == 12 and base.startswith("91"):
+                        add_candidate(base[2:])        # 10-digit
+                        add_candidate(f"0{base[2:]}")  # 11-digit
+                    elif len(base) == 10:
+                        add_candidate(f"91{base}")     # 12-digit with 91
+                        add_candidate(f"0{base}")      # 11-digit with 0
+                    elif len(base) == 11 and base.startswith("0"):
+                        add_candidate(base[1:])        # 10-digit
+                        add_candidate(f"91{base[1:]}") # 12-digit
 
                 for alt_caller_id in candidates:
                     logger.info(
@@ -185,9 +201,16 @@ class SmartfloProvider(TelephonyProvider):
             logger.error(
                 f"[Smartflo] API error response status={response.status_code}: {response.text}"
             )
+            err_detail = f"Smartflo API call failed with status {response.status_code}: {response.text}"
+            if response.status_code == 422 and "caller_id" in response.text:
+                err_detail = (
+                    f"Smartflo rejected caller_id '{caller_id}'. "
+                    f"Ensure this DID is an active virtual number provisioned on your Tata Smartflo portal "
+                    f"for the configured API key. Smartflo response: {response.text}"
+                )
             raise HTTPException(
                 status_code=400 if response.status_code == 422 else response.status_code,
-                detail=f"Smartflo API call failed with status {response.status_code}: {response.text}",
+                detail=err_detail,
             )
 
         try:

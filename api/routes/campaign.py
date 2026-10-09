@@ -913,17 +913,14 @@ async def create_campaign(
         now_utc = datetime.now(UTC)
         async with db_client.async_session() as session:
             # Self-heal schema defensively for queued_runs in case migrations were pending
-            await session.execute(
-                text(
-                    """
-                    ALTER TABLE queued_runs ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
-                    ALTER TABLE queued_runs ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
-                    ALTER TABLE queued_runs ADD COLUMN IF NOT EXISTS parent_queued_run_id INTEGER;
-                    ALTER TABLE queued_runs ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ;
-                    ALTER TABLE queued_runs ADD COLUMN IF NOT EXISTS retry_reason VARCHAR;
-                    """
-                )
-            )
+            for ddl in (
+                "ALTER TABLE queued_runs ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
+                "ALTER TABLE queued_runs ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0",
+                "ALTER TABLE queued_runs ADD COLUMN IF NOT EXISTS parent_queued_run_id INTEGER",
+                "ALTER TABLE queued_runs ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ",
+                "ALTER TABLE queued_runs ADD COLUMN IF NOT EXISTS retry_reason VARCHAR",
+            ):
+                await session.execute(text(ddl))
             for item in contacts_to_dial:
                 qr = QueuedRunModel(
                     campaign_id=campaign.id,
@@ -1021,41 +1018,110 @@ async def trigger_test_call(
         if wf:
             workflow_name = wf.name
 
-    # Resolve outbound caller ID strictly from Telephony Inventory
+    # Resolve outbound caller ID strictly from Telephony Inventory / Org Numbers
     from_number = request.from_phone_number
     telephony_config_id = request.telephony_configuration_id
     from_phone_id = request.from_phone_number_id
 
-    # Fetch platform inventory to resolve configured test numbers
-    inventory = await db_client.list_all_platform_inventory()
-    if inventory:
-        # If user picked a specific number, match its config and id
-        matched_item = None
-        if from_number:
-            matched_item = next(
-                (item for item in inventory if item.get("phone_number") == from_number or item.get("address") == from_number),
-                None,
-            )
-        if not matched_item:
-            # Prioritize verified number (+14786063123)
-            matched_item = next(
-                (item for item in inventory if "3123" in str(item.get("phone_number", "")) or "3123" in str(item.get("address", ""))),
-                None,
-            )
-        if not matched_item:
-            matched_item = inventory[0]
-        
-        if matched_item:
-            from_number = matched_item.get("phone_number") or matched_item.get("address")
-            telephony_config_id = (
-                telephony_config_id
-                or matched_item.get("configuration_id")
-                or matched_item.get("telephony_configuration_id")
-            )
-            from_phone_id = from_phone_id or matched_item.get("id")
+    # 1. First, check if from_phone_id belongs to the user's organization or is platform inventory
+    resolved_org_phone = None
+    if from_phone_id:
+        pn = await db_client.get_phone_number(from_phone_id)
+        if pn and pn.is_active:
+            if not user.selected_organization_id or pn.organization_id == user.selected_organization_id:
+                resolved_org_phone = pn
+            elif pn.is_platform_inventory or pn.pool_type in ("shared_trial", "shared_multi_org") or getattr(pn, "assigned_organization_id", None) == user.selected_organization_id:
+                try:
+                    from api.services.telephony.shared_trial_sync import sync_shared_trial_telephony_for_org
+                    if user.selected_organization_id:
+                        await sync_shared_trial_telephony_for_org(user.selected_organization_id)
+                    async with db_client.async_session() as session:
+                        stmt = select(TelephonyPhoneNumberModel).where(
+                            TelephonyPhoneNumberModel.organization_id == user.selected_organization_id,
+                            TelephonyPhoneNumberModel.address_normalized == pn.address_normalized,
+                            TelephonyPhoneNumberModel.is_active == True,
+                        )
+                        resolved_org_phone = (await session.execute(stmt)).scalars().first()
+                except Exception as e:
+                    logger.debug(f"Error resolving platform inventory number to org: {e}")
+                if not resolved_org_phone:
+                    resolved_org_phone = pn
+
+    # 2. If not resolved by id, check if from_number matches any of the organization's phone numbers
+    if not resolved_org_phone and from_number and user.selected_organization_id:
+        try:
+            configs = await db_client.list_telephony_configurations(user.selected_organization_id)
+            clean_from = from_number.replace(" ", "").replace("-", "")
+            for cfg in configs:
+                cfg_numbers = await db_client.list_phone_numbers_for_config(cfg.id)
+                for num_row in cfg_numbers:
+                    num_addr = (num_row.address or "").replace(" ", "").replace("-", "")
+                    num_norm = (num_row.address_normalized or "").replace(" ", "").replace("-", "")
+                    if num_row.is_active and (
+                        clean_from == num_addr
+                        or clean_from == num_norm
+                        or clean_from.endswith(num_addr)
+                        or num_addr.endswith(clean_from)
+                    ):
+                        resolved_org_phone = num_row
+                        break
+                if resolved_org_phone:
+                    break
+        except Exception as e:
+            logger.debug(f"Error checking org numbers: {e}")
+
+    if resolved_org_phone:
+        from_phone_id = resolved_org_phone.id
+        from_number = resolved_org_phone.address_normalized or resolved_org_phone.address
+        telephony_config_id = resolved_org_phone.telephony_configuration_id
     else:
-        if not from_number:
-            from_number = "+919876543210"
+        # Fall back to platform inventory only if no organization number was selected or matched
+        inventory = await db_client.list_all_platform_inventory()
+        if inventory:
+            # If user picked a specific number, match its config and id
+            matched_item = None
+            if from_phone_id:
+                matched_item = next(
+                    (item for item in inventory if item.get("id") == from_phone_id),
+                    None,
+                )
+            if not matched_item and from_number:
+                clean_from = from_number.replace(" ", "").replace("-", "")
+                clean_digits = re.sub(r"[^\d]", "", clean_from)
+                matched_item = next(
+                    (
+                        item for item in inventory
+                        if clean_from == (item.get("phone_number") or "").replace(" ", "").replace("-", "")
+                        or clean_from == (item.get("address") or "").replace(" ", "").replace("-", "")
+                        or (clean_digits and clean_digits in re.sub(r"[^\d]", "", item.get("phone_number") or ""))
+                        or (clean_digits and re.sub(r"[^\d]", "", item.get("phone_number") or "").endswith(clean_digits))
+                        or (clean_digits and clean_digits.endswith(re.sub(r"[^\d]", "", item.get("phone_number") or "")))
+                    ),
+                    None,
+                )
+            if not matched_item and not from_number and not from_phone_id:
+                # Prioritize verified number (+14786063123) only if no number was requested
+                matched_item = next(
+                    (
+                        item for item in inventory
+                        if "3123" in str(item.get("phone_number", "")) or "3123" in str(item.get("address", ""))
+                    ),
+                    None,
+                )
+            if not matched_item:
+                matched_item = inventory[0]
+            
+            if matched_item:
+                from_number = matched_item.get("phone_number") or matched_item.get("address")
+                telephony_config_id = (
+                    telephony_config_id
+                    or matched_item.get("configuration_id")
+                    or matched_item.get("telephony_configuration_id")
+                )
+                from_phone_id = matched_item.get("id")
+        else:
+            if not from_number:
+                from_number = "+919876543210"
 
     # Ensure shared trial telephony is provisioned for this organization
     try:

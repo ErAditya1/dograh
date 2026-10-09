@@ -8,6 +8,7 @@ import {
   Pencil,
   Plus,
   RotateCcw,
+  ShieldCheck,
   Star,
   Trash2,
 } from "lucide-react";
@@ -243,16 +244,40 @@ export default function TelephonyConfigurationDetailPage() {
     );
   }
 
+  const isClaimedPlatform = Boolean(
+    config?.is_claimed ||
+    config?.is_platform_inventory ||
+    config?.is_shared_trial ||
+    (config?.name && config.name.startsWith("Platform - "))
+  );
+
   return (
     <div className="container mx-auto px-4 py-8 space-y-6">
       <div>
         <Link
-          href="/telephony-configurations"
+          href={isClaimedPlatform ? "/telephony-configurations?tab=claimed" : "/telephony-configurations?tab=byo"}
           className="inline-flex items-center text-sm text-muted-foreground hover:underline"
         >
-          <ArrowLeft className="h-4 w-4 mr-1" /> All configurations
+          <ArrowLeft className="h-4 w-4 mr-1" />
+          {isClaimedPlatform ? "Back to Claimed Numbers" : "All configurations"}
         </Link>
       </div>
+
+      {isClaimedPlatform && (
+        <div className="rounded-lg border border-teal-500/30 bg-teal-500/10 p-4">
+          <div className="flex items-start gap-3">
+            <ShieldCheck className="h-5 w-5 shrink-0 mt-0.5 text-teal-600 dark:text-teal-400" />
+            <div className="space-y-1 text-sm">
+              <p className="font-semibold text-teal-900 dark:text-teal-200">
+                Claimed Platform Telephony Number
+              </p>
+              <p className="text-teal-800/80 dark:text-teal-300/80">
+                This number is allocated directly from the platform inventory. Carrier routing, SIP credentials, and trunking are fully managed by the platform and cannot be modified. You can freely assign inbound workflows and set caller IDs below.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       <Card>
         <CardHeader className="flex flex-row items-start justify-between gap-4">
@@ -260,6 +285,14 @@ export default function TelephonyConfigurationDetailPage() {
             <div className="flex items-center gap-2 flex-wrap">
               <CardTitle className="truncate">{config.name}</CardTitle>
               <Badge variant="secondary">{config.provider}</Badge>
+              {isClaimedPlatform && (
+                <Badge
+                  variant="outline"
+                  className="border-teal-500/40 bg-teal-500/10 text-teal-700 dark:text-teal-400 font-medium"
+                >
+                  Claimed Platform Number
+                </Badge>
+              )}
               {config.is_default_outbound && (
                 <Badge className="gap-1">
                   <Star className="h-3 w-3 fill-current" />
@@ -296,9 +329,11 @@ export default function TelephonyConfigurationDetailPage() {
                 <Star className="h-4 w-4 mr-2" /> Set as default
               </Button>
             )}
-            <Button variant="outline" size="sm" onClick={() => setEditConfigOpen(true)}>
-              <Pencil className="h-4 w-4 mr-2" /> Edit credentials
-            </Button>
+            {!isClaimedPlatform && (
+              <Button variant="outline" size="sm" onClick={() => setEditConfigOpen(true)}>
+                <Pencil className="h-4 w-4 mr-2" /> Edit credentials
+              </Button>
+            )}
           </div>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -327,19 +362,36 @@ export default function TelephonyConfigurationDetailPage() {
               </div>
             </div>
           )}
-          <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
-            {Object.entries(config.credentials ?? {})
-              .filter(([key]) => key !== "external_pbx" || externalPbxIntegrationsEnabled)
-              .filter(([key]) => key !== "stasis_app_name")
-              .map(([k, v]) => (
-                <div key={k} className="flex justify-between gap-3">
-                  <dt className="text-muted-foreground">{k}</dt>
-                  <dd className="font-mono text-right truncate max-w-[60%]">
-                    {v && typeof v === "object" ? "Configured" : String(v ?? "")}
-                  </dd>
-                </div>
-              ))}
-          </dl>
+          {isClaimedPlatform ? (
+            <div className="rounded-md bg-muted/40 p-4 text-sm flex flex-col gap-2">
+              <div className="flex justify-between items-center text-sm">
+                <span className="text-muted-foreground">Configuration Type</span>
+                <span className="font-medium">Platform Managed Inventory</span>
+              </div>
+              <div className="flex justify-between items-center text-sm">
+                <span className="text-muted-foreground">Carrier Gateway</span>
+                <span className="font-mono text-xs">{config.provider.toUpperCase()}</span>
+              </div>
+              <div className="flex justify-between items-center text-sm">
+                <span className="text-muted-foreground">Status</span>
+                <span className="text-emerald-600 dark:text-emerald-400 font-medium">Ready & Operational</span>
+              </div>
+            </div>
+          ) : (
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+              {Object.entries(config.credentials ?? {})
+                .filter(([key]) => key !== "external_pbx" || externalPbxIntegrationsEnabled)
+                .filter(([key]) => key !== "stasis_app_name")
+                .map(([k, v]) => (
+                  <div key={k} className="flex justify-between gap-3">
+                    <dt className="text-muted-foreground">{k}</dt>
+                    <dd className="font-mono text-right truncate max-w-[60%]">
+                      {v && typeof v === "object" ? "Configured" : String(v ?? "")}
+                    </dd>
+                  </div>
+                ))}
+            </dl>
+          )}
           {stasisAppName && (
             <div className="space-y-1 rounded-md border border-dashed p-3">
               <p className="text-sm font-medium">Route calls into this Stasis application</p>
@@ -384,14 +436,14 @@ export default function TelephonyConfigurationDetailPage() {
         </CardContent>
       </Card>
 
-      {config.setup_checklist ? (
+      {config.setup_checklist && !isClaimedPlatform ? (
         <SetupChecklistCard
           checklist={config.setup_checklist}
           connectivity={config.connectivity}
         />
       ) : null}
 
-      {config.sip_connectivity?.regions.length ? (
+      {config.sip_connectivity?.regions.length && !isClaimedPlatform ? (
         <SipConnectivityCard
           details={config.sip_connectivity}
           // The checklist sends the user in here for the endpoints to hand
@@ -400,7 +452,7 @@ export default function TelephonyConfigurationDetailPage() {
         />
       ) : null}
 
-      {config.supports_trunks ? (
+      {config.supports_trunks && !isClaimedPlatform ? (
         <TrunkCard
           configuration={config}
           phoneNumbers={phoneNumbers}
@@ -427,9 +479,11 @@ export default function TelephonyConfigurationDetailPage() {
               </a>
             </CardDescription>
           </div>
-          <Button size="sm" onClick={() => openPhoneDialog(null)}>
-            <Plus className="h-4 w-4 mr-2" /> Add phone number
-          </Button>
+          {!isClaimedPlatform && (
+            <Button size="sm" onClick={() => openPhoneDialog(null)}>
+              <Plus className="h-4 w-4 mr-2" /> Add phone number
+            </Button>
+          )}
         </CardHeader>
         <CardContent>
           {phoneNumbers.length === 0 ? (
@@ -555,14 +609,16 @@ export default function TelephonyConfigurationDetailPage() {
                         >
                           <Pencil className="h-4 w-4" />
                         </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => setPhoneDeleteTarget(n)}
-                          title="Delete"
-                        >
-                          <Trash2 className="h-4 w-4 text-destructive" />
-                        </Button>
+                        {!isClaimedPlatform && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setPhoneDeleteTarget(n)}
+                            title="Delete"
+                          >
+                            <Trash2 className="h-4 w-4 text-destructive" />
+                          </Button>
+                        )}
                       </div>
                     </TableCell>
                   </TableRow>
