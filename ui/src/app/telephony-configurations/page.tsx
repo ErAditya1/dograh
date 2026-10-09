@@ -1,27 +1,54 @@
 "use client";
 
-import { HugeiconsIcon } from "@hugeicons/react";
 import {
-  CheckmarkCircle02Icon,
-  ChevronRightIcon,
-  Copy01Icon,
-  Delete02Icon,
-  ExternalLinkIcon,
-  GlobeIcon,
-  Loading02Icon,
-  LockIcon,
-  PencilIcon,
-  PhoneIcon,
-  PlusIcon,
-  RotateCcwIcon,
-  ShieldCheckIcon,
-  ShoppingCart01Icon,
-  SparklesIcon,
-  StarIcon,
-  TriangleAlertIcon,
-  UserGroupIcon,
-  ZapIcon,
-} from "@hugeicons/core-free-icons";
+  AlertTriangle,
+  CheckCircle2,
+  ChevronRight,
+  Copy,
+  ExternalLink,
+  Globe,
+  Loader2,
+  Lock,
+  Pencil,
+  Phone,
+  Plus,
+  RotateCcw,
+  ShieldCheck,
+  ShoppingCart,
+  Sparkles,
+  Star,
+  Trash2,
+  Users,
+  Zap,
+} from "lucide-react";
+
+const HugeiconsIcon = ({
+  icon: Icon,
+  className,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  className?: string;
+}) => <Icon className={className} />;
+
+const CheckmarkCircle02Icon = CheckCircle2;
+const ChevronRightIcon = ChevronRight;
+const Copy01Icon = Copy;
+const Delete02Icon = Trash2;
+const ExternalLinkIcon = ExternalLink;
+const GlobeIcon = Globe;
+const Loading02Icon = Loader2;
+const LockIcon = Lock;
+const PencilIcon = Pencil;
+const PhoneIcon = Phone;
+const PlusIcon = Plus;
+const RotateCcwIcon = RotateCcw;
+const ShieldCheckIcon = ShieldCheck;
+const ShoppingCart01Icon = ShoppingCart;
+const SparklesIcon = Sparkles;
+const StarIcon = Star;
+const TriangleAlertIcon = AlertTriangle;
+const UserGroupIcon = Users;
+const ZapIcon = Zap;
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
@@ -928,18 +955,33 @@ export default function TelephonyConfigurationsPage() {
                         <div>
                           <p className="text-muted-foreground text-[11px]">Phone Numbers</p>
                           <p className="font-semibold text-foreground text-sm">
-                            {item.active_phone_number_count}
+                            {item.phone_number_count ?? 0}
                           </p>
                         </div>
-                        {item.supports_trunks && (
-                          <div>
-                            <p className="text-muted-foreground text-[11px]">SIP Trunks</p>
-                            <p className="font-semibold text-foreground text-sm">
-                              {item.enabled_trunk_count}
-                            </p>
-                          </div>
-                        )}
+                        <div>
+                          <p className="text-muted-foreground text-[11px]">Status</p>
+                          <p className="font-semibold text-foreground text-sm">
+                            {item.inactive ? (
+                              <span className="text-destructive font-medium">Inactive</span>
+                            ) : item.is_ready_for_outbound === false ? (
+                              <span className="text-amber-600 dark:text-amber-400 font-medium">Incomplete</span>
+                            ) : (
+                              <span className="text-emerald-600 dark:text-emerald-400 font-medium">Ready</span>
+                            )}
+                          </p>
+                        </div>
                       </div>
+
+                      {item.inactive && item.inactive_reason && (
+                        <p className="text-[11px] text-destructive">
+                          {item.inactive_reason}
+                        </p>
+                      )}
+                      {!item.inactive && item.outbound_blocked_reason && (
+                        <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                          {item.outbound_blocked_reason}
+                        </p>
+                      )}
 
                       <div className="pt-2 border-t flex items-center justify-between gap-2">
                         <div className="flex items-center gap-1">
