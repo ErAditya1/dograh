@@ -76,6 +76,7 @@ class InitiateCallRequest(BaseModel):
     # Optional caller-ID phone number to dial out from. Must belong to the
     # resolved telephony configuration; otherwise the provider picks one.
     from_phone_number_id: int | None = None
+    from_phone_number: str | None = None
     call_origin: str | None = None
     voice: str | None = None
     voice_id: str | None = None
@@ -144,6 +145,28 @@ async def initiate_call(
     # config that is ready for outbound. This happens before run creation so a
     # setup problem does not land in run history as a failed call.
     target_config_id = request.telephony_configuration_id
+    if request.from_phone_number and request.from_phone_number_id is None and user.selected_organization_id:
+        try:
+            clean_str = re.sub(r"[^\d]", "", request.from_phone_number)
+            configs = await db_client.list_telephony_configurations(user.selected_organization_id)
+            for cfg in configs:
+                cfg_numbers = await db_client.list_phone_numbers_for_config(cfg.id)
+                for num_row in cfg_numbers:
+                    clean_row = re.sub(r"[^\d]", "", num_row.address_normalized or num_row.address or "")
+                    if num_row.is_active and (
+                        clean_str == clean_row
+                        or clean_str.endswith(clean_row)
+                        or clean_row.endswith(clean_str)
+                    ):
+                        request.from_phone_number_id = num_row.id
+                        if target_config_id is None:
+                            target_config_id = num_row.telephony_configuration_id
+                        break
+                if request.from_phone_number_id is not None:
+                    break
+        except Exception as e:
+            logger.debug(f"Error resolving from_phone_number in initiate_call: {e}")
+
     if request.from_phone_number_id is not None:
         pn_lookup = await db_client.get_phone_number(request.from_phone_number_id)
         if pn_lookup and pn_lookup.is_active:
@@ -273,6 +296,21 @@ async def initiate_call(
     # the user's organization, so filtering by config_id is sufficient for
     # tenant isolation.
     from_number: str | None = None
+    if request.from_phone_number_id is None and telephony_configuration_id:
+        try:
+            default_pn = await db_client.get_default_caller_id(telephony_configuration_id)
+            if not default_pn or not default_pn.is_active:
+                cfg_pns = await db_client.list_phone_numbers_for_config(telephony_configuration_id)
+                for cp in cfg_pns:
+                    if cp.is_active:
+                        default_pn = cp
+                        break
+            if default_pn and default_pn.is_active:
+                request.from_phone_number_id = default_pn.id
+                from_number = default_pn.address_normalized or default_pn.address
+        except Exception as e:
+            logger.debug(f"Error auto-resolving default caller ID: {e}")
+
     if request.from_phone_number_id is not None:
         if telephony_configuration_id is None:
             raise HTTPException(

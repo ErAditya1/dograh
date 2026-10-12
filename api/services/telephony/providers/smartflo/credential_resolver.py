@@ -52,30 +52,73 @@ def resolve_smartflo_credentials(
     phone_metadata = org_config.get("phone_numbers_metadata") or {}
     target_meta: Dict[str, Any] = {}
 
+    def lookup_number_meta(val: Any) -> Dict[str, Any]:
+        if not val:
+            return {}
+        s = str(val).strip()
+        if not s:
+            return {}
+        if s in phone_metadata:
+            return phone_metadata[s] or {}
+        clean_d = re.sub(r"[^\d]", "", s)
+        if not clean_d:
+            return {}
+        if clean_d in phone_metadata:
+            return phone_metadata[clean_d] or {}
+        if len(clean_d) == 12 and clean_d.startswith("91") and clean_d[2:] in phone_metadata:
+            return phone_metadata[clean_d[2:]] or {}
+        if len(clean_d) == 10 and f"91{clean_d}" in phone_metadata:
+            return phone_metadata[f"91{clean_d}"] or {}
+        if len(clean_d) == 11 and clean_d.startswith("0") and clean_d[1:] in phone_metadata:
+            return phone_metadata[clean_d[1:]] or {}
+        if len(clean_d) == 10 and f"0{clean_d}" in phone_metadata:
+            return phone_metadata[f"0{clean_d}"] or {}
+        return {}
+
+    from_numbers = org_config.get("from_numbers") or []
+    first_from_number = from_numbers[0] if isinstance(from_numbers, list) and from_numbers else None
+
+    # Resolve preliminary candidate DID first
+    candidate_did = (
+        from_number
+        or call_details.get("caller_id")
+        or call_details.get("from_number")
+        or call_details.get("smartflo_did_number")
+        or org_config.get("default_from_number")
+        or org_config.get("smartflo_did_number")
+        or first_from_number
+        or os.getenv("SMARTFLO_DID_NUMBER")
+    )
+
     number_candidates = [
-        str(from_number or "").strip(),
-        str(call_details.get("caller_id") or "").strip(),
-        str(call_details.get("from_number") or "").strip(),
-        str(call_details.get("smartflo_did_number") or "").strip(),
+        from_number,
+        call_details.get("caller_id"),
+        call_details.get("from_number"),
+        call_details.get("smartflo_did_number"),
+        candidate_did,
     ]
     for num in number_candidates:
-        if not num:
-            continue
-        clean_d = re.sub(r"[^\d]", "", num)
-        if num in phone_metadata:
-            target_meta = phone_metadata[num] or {}
-            break
-        if clean_d and clean_d in phone_metadata:
-            target_meta = phone_metadata[clean_d] or {}
-            break
-        if len(clean_d) == 12 and clean_d.startswith("91") and clean_d[2:] in phone_metadata:
-            target_meta = phone_metadata[clean_d[2:]] or {}
-            break
-        if len(clean_d) == 10 and f"91{clean_d}" in phone_metadata:
-            target_meta = phone_metadata[f"91{clean_d}"] or {}
+        meta_found = lookup_number_meta(num)
+        if meta_found:
+            target_meta = meta_found
             break
 
-    # 1. Click-to-Call API Key (Request > Per-Number Metadata > Agent Config > Org Config > Environment)
+    # 1. Final DID Number / Caller ID (Explicit from_number > Request > Target Meta > Org Default Phone > Environment)
+    did_number = (
+        from_number
+        or call_details.get("caller_id")
+        or call_details.get("from_number")
+        or call_details.get("smartflo_did_number")
+        or target_meta.get("smartflo_did_number")
+        or target_meta.get("did_number")
+        or candidate_did
+    )
+
+    # Re-verify target_meta with final did_number if not already found
+    if not target_meta and did_number:
+        target_meta = lookup_number_meta(did_number)
+
+    # 2. Click-to-Call API Key (Request > Per-Number Metadata > Agent Config > Org Config > Environment)
     click_to_call_api_key = (
         call_details.get("smartflo_api_key")
         or call_details.get("click_to_call_api_key")
@@ -86,23 +129,6 @@ def resolve_smartflo_credentials(
         or agent_config.get("click_to_call_api_key")
         or org_config.get("click_to_call_api_key")
         or os.getenv("SMARTFLO_CLICK_TO_CALL_API_KEY")
-    )
-
-    # 2. DID Number / Caller ID (Explicit from_number > Request > Target Meta > Org Default Phone > Environment)
-    from_numbers = org_config.get("from_numbers") or []
-    first_from_number = from_numbers[0] if isinstance(from_numbers, list) and from_numbers else None
-
-    did_number = (
-        from_number
-        or call_details.get("caller_id")
-        or call_details.get("from_number")
-        or call_details.get("smartflo_did_number")
-        or target_meta.get("smartflo_did_number")
-        or target_meta.get("did_number")
-        or org_config.get("default_from_number")
-        or org_config.get("smartflo_did_number")
-        or first_from_number
-        or os.getenv("SMARTFLO_DID_NUMBER")
     )
 
     # 3. JWT Token (Request > Per-Number Metadata > Agent Config > Org Config > Environment)

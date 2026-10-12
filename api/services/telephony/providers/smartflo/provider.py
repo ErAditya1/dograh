@@ -158,8 +158,14 @@ class SmartfloProvider(TelephonyProvider):
                         seen_candidates.add(val)
                         candidates.append(val)
 
-                # Prioritize the verified Smartflo DID, then clean_from
+                # Prioritize the verified Smartflo DID, then clean_from, then other available config numbers
                 base_numbers = [clean_did, caller_id, clean_from] if clean_did else [caller_id, clean_from]
+                other_from_numbers = self.config.get("from_numbers") or []
+                for other_fn in other_from_numbers:
+                    clean_other = clean_num(other_fn)
+                    if clean_other and clean_other not in base_numbers:
+                        base_numbers.append(clean_other)
+
                 for base in base_numbers:
                     if not base:
                         continue
@@ -174,11 +180,28 @@ class SmartfloProvider(TelephonyProvider):
                         add_candidate(base[1:])        # 10-digit
                         add_candidate(f"91{base[1:]}") # 12-digit
 
+                phone_metadata = self.config.get("phone_numbers_metadata") or {}
+
                 for alt_caller_id in candidates:
                     logger.info(
                         f"[Smartflo] Retrying call with candidate caller_id: {alt_caller_id} (original: {caller_id})"
                     )
                     payload["caller_id"] = alt_caller_id
+
+                    # If this candidate has dedicated credentials in phone_numbers_metadata, use them for the retry
+                    alt_meta = phone_metadata.get(alt_caller_id) or {}
+                    if not alt_meta and len(alt_caller_id) == 10:
+                        alt_meta = phone_metadata.get(f"91{alt_caller_id}") or {}
+                    if not alt_meta and len(alt_caller_id) == 12 and alt_caller_id.startswith("91"):
+                        alt_meta = phone_metadata.get(alt_caller_id[2:]) or {}
+
+                    alt_key = (
+                        alt_meta.get("click_to_call_api_key")
+                        or alt_meta.get("smartflo_api_key")
+                        or alt_meta.get("api_key")
+                    )
+                    payload["api_key"] = alt_key or api_key
+
                     try:
                         retry_resp = await client.post(
                             endpoint_url,
