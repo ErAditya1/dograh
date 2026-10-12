@@ -317,8 +317,9 @@ class CallConcurrencyService:
         """
         Inspect and purge orphaned/zombie concurrency slots for an organization.
         Reconciles:
-        1. Slots linked to workflow runs that have already finished (is_completed=True, state in ('completed', 'failed', 'cancelled')).
-        2. Unbound reservation slots older than 60 seconds (abandoned starts).
+        1. Slots linked to workflow runs that have already finished (is_completed=True, state in ('completed', 'failed', 'cancelled', 'no_answer', 'busy', 'rejected')).
+        2. Slots linked to runs that were initiated > 40s ago but never transitioned to running (dropped before audio connect).
+        3. Unbound reservation slots older than 30 seconds (abandoned starts).
         Returns count of reclaimed slots.
         """
         try:
@@ -333,18 +334,49 @@ class CallConcurrencyService:
                 if workflow_run_id:
                     try:
                         run = await db_client.get_workflow_run_by_id(workflow_run_id)
-                        if run and (run.is_completed or run.state in ("completed", "failed", "cancelled")):
+                        if not run:
+                            logger.info(
+                                f"Reconciling orphaned call slot {slot_id} for org {organization_id}: "
+                                f"workflow run {workflow_run_id} does not exist in DB"
+                            )
+                            await self.release_workflow_run_slot(workflow_run_id)
+                            reclaimed += 1
+                        elif run.is_completed or run.state in (
+                            "completed",
+                            "failed",
+                            "cancelled",
+                            "no_answer",
+                            "busy",
+                            "rejected",
+                            "not_connected",
+                            "user_hangup",
+                        ):
                             logger.info(
                                 f"Reconciling zombie call slot {slot_id} for org {organization_id}: "
                                 f"workflow run {workflow_run_id} is already terminal (state={run.state})"
                             )
                             await self.release_workflow_run_slot(workflow_run_id)
                             reclaimed += 1
+                        elif (now - score) > 40 and run.state not in ("running", "in_call", "connected"):
+                            logger.info(
+                                f"Reconciling dropped/unanswered call slot {slot_id} for org {organization_id}: "
+                                f"workflow run {workflow_run_id} never reached running state (state={run.state}, age={now - score:.1f}s)"
+                            )
+                            await self.release_workflow_run_slot(workflow_run_id)
+                            reclaimed += 1
+                            try:
+                                await db_client.update_workflow_run(
+                                    run_id=workflow_run_id,
+                                    is_completed=True,
+                                    state="not_connected",
+                                )
+                            except Exception:
+                                pass
                     except Exception as re:
                         logger.debug(f"Error checking workflow run {workflow_run_id} status: {re}")
                 else:
-                    # Unbound slot. If it was acquired > 60s ago, it is an abandoned reservation
-                    if (now - score) > 60:
+                    # Unbound slot. If it was acquired > 30s ago, it is an abandoned reservation
+                    if (now - score) > 30:
                         logger.info(
                             f"Reconciling unbound abandoned slot {slot_id} for org {organization_id} "
                             f"(age={now - score:.1f}s)"

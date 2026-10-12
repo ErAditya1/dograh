@@ -3,6 +3,7 @@ Telephony routes - handles all telephony-related endpoints.
 Consolidated from split modules for easier maintenance.
 """
 
+import asyncio
 import json
 import uuid
 from typing import Optional
@@ -453,7 +454,41 @@ async def initiate_call(
         initial_context=updated_initial_context,
     )
 
+    # Launch background watchdog: if the call drops, is rejected, or never connects to audio,
+    # automatically free the concurrency slot so future calls/campaigns are never starved.
+    asyncio.create_task(
+        _watchdog_outbound_call_concurrency(
+            workflow_run_id=workflow_run_id,
+            organization_id=user.selected_organization_id,
+            timeout_seconds=45,
+        )
+    )
+
     return {"message": f"Call initiated successfully with run name {workflow_run_name}"}
+
+
+async def _watchdog_outbound_call_concurrency(
+    workflow_run_id: int, organization_id: int, timeout_seconds: int = 45
+) -> None:
+    """Ensure that if an outbound call is rejected, unanswered, or disconnected before audio stream,
+    its concurrency slot is automatically freed so future calls and campaigns are never blocked."""
+    try:
+        await asyncio.sleep(timeout_seconds)
+        run = await db_client.get_workflow_run_by_id(workflow_run_id)
+        if run and not run.is_completed and run.state not in ("running", "in_call", "connected"):
+            logger.info(
+                f"[concurrency watchdog] Outbound call run {workflow_run_id} (org {organization_id}) "
+                f"did not reach running state within {timeout_seconds}s (current state={run.state}). "
+                "Auto-releasing concurrent slot to prevent capacity starvation."
+            )
+            await call_concurrency.unregister_active_call(workflow_run_id)
+            await db_client.update_workflow_run(
+                run_id=workflow_run_id,
+                is_completed=True,
+                state="not_connected",
+            )
+    except Exception as e:
+        logger.debug(f"[concurrency watchdog] Error in watchdog for run {workflow_run_id}: {e}")
 
 
 @router.post("/concurrency/reset")

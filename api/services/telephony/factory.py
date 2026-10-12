@@ -361,12 +361,28 @@ async def _normalize_with_phone_numbers(
     for pn in phone_numbers:
         if pn.is_active and pn.extra_metadata:
             meta = dict(pn.extra_metadata)
-            phone_numbers_metadata[pn.address_normalized] = meta
-            digits = re.sub(r"[^\d]", "", pn.address_normalized)
-            if digits:
-                phone_numbers_metadata[digits] = meta
+            if pn.address_normalized:
+                phone_numbers_metadata[pn.address_normalized] = meta
+                digits = re.sub(r"[^\d]", "", pn.address_normalized)
+                if digits:
+                    phone_numbers_metadata[digits] = meta
+                    if len(digits) == 12 and digits.startswith("91"):
+                        phone_numbers_metadata[digits[2:]] = meta
+                        phone_numbers_metadata[f"0{digits[2:]}"] = meta
+                    elif len(digits) == 10:
+                        phone_numbers_metadata[f"91{digits}"] = meta
+                        phone_numbers_metadata[f"0{digits}"] = meta
             if pn.address and pn.address != pn.address_normalized:
                 phone_numbers_metadata[pn.address] = meta
+                addr_digits = re.sub(r"[^\d]", "", pn.address)
+                if addr_digits:
+                    phone_numbers_metadata[addr_digits] = meta
+                    if len(addr_digits) == 12 and addr_digits.startswith("91"):
+                        phone_numbers_metadata[addr_digits[2:]] = meta
+                        phone_numbers_metadata[f"0{addr_digits[2:]}"] = meta
+                    elif len(addr_digits) == 10:
+                        phone_numbers_metadata[f"91{addr_digits}"] = meta
+                        phone_numbers_metadata[f"0{addr_digits}"] = meta
     base["phone_numbers_metadata"] = phone_numbers_metadata
 
     default_row = await db_client.get_default_caller_id(row.id)

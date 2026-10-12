@@ -56,6 +56,7 @@ def resolve_smartflo_credentials(
         str(from_number or "").strip(),
         str(call_details.get("caller_id") or "").strip(),
         str(call_details.get("from_number") or "").strip(),
+        str(call_details.get("smartflo_did_number") or "").strip(),
     ]
     for num in number_candidates:
         if not num:
@@ -66,6 +67,12 @@ def resolve_smartflo_credentials(
             break
         if clean_d and clean_d in phone_metadata:
             target_meta = phone_metadata[clean_d] or {}
+            break
+        if len(clean_d) == 12 and clean_d.startswith("91") and clean_d[2:] in phone_metadata:
+            target_meta = phone_metadata[clean_d[2:]] or {}
+            break
+        if len(clean_d) == 10 and f"91{clean_d}" in phone_metadata:
+            target_meta = phone_metadata[f"91{clean_d}"] or {}
             break
 
     # 1. Click-to-Call API Key (Request > Per-Number Metadata > Agent Config > Org Config > Environment)
@@ -81,7 +88,7 @@ def resolve_smartflo_credentials(
         or os.getenv("SMARTFLO_CLICK_TO_CALL_API_KEY")
     )
 
-    # 2. DID Number / Caller ID (Explicit from_number > Request > Org Default Phone > Environment)
+    # 2. DID Number / Caller ID (Explicit from_number > Request > Target Meta > Org Default Phone > Environment)
     from_numbers = org_config.get("from_numbers") or []
     first_from_number = from_numbers[0] if isinstance(from_numbers, list) and from_numbers else None
 
@@ -90,6 +97,8 @@ def resolve_smartflo_credentials(
         or call_details.get("caller_id")
         or call_details.get("from_number")
         or call_details.get("smartflo_did_number")
+        or target_meta.get("smartflo_did_number")
+        or target_meta.get("did_number")
         or org_config.get("default_from_number")
         or org_config.get("smartflo_did_number")
         or first_from_number

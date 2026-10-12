@@ -789,6 +789,7 @@ class PlanService:
             "call_cost_usd": call_cost_usd,
             "plan_credits_deducted": plan_credits_deducted,
             "plan_credits_remaining": new_plan_credits,
+            "plan_minutes_deducted": round(call_duration_minutes, 2) if charged_to in ("plan_credits", "split") else 0.0,
             "wallet_cost_usd": wallet_cost_usd,
             "wallet_balance_after": new_wallet_balance,
             "effective_tier": limits.tier,

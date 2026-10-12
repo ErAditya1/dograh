@@ -293,9 +293,15 @@ class TelephonyBillingService:
             if not num:
                 raise ValueError("Phone number not found")
 
+            # Resolve configuration safely without lazy relationship loading
+            config = await session.get(
+                TelephonyConfigurationModel, num.telephony_configuration_id
+            )
+            is_platform_cfg = bool(config and config.name.startswith("Platform - "))
+
             # Resolve to the master inventory record
             master_num = num
-            if not num.is_platform_inventory or (num.configuration and num.configuration.name.startswith("Platform - ")):
+            if not num.is_platform_inventory or is_platform_cfg:
                 stmt_master = (
                     select(TelephonyPhoneNumberModel)
                     .join(
@@ -335,7 +341,12 @@ class TelephonyBillingService:
                     TelephonyPhoneNumberModel.organization_id == organization_id,
                     TelephonyPhoneNumberModel.address_normalized == num.address_normalized,
                 )
-                .values(is_active=False, rental_status="released")
+                .values(
+                    is_active=False,
+                    rental_status="released",
+                    is_default_caller_id=False,
+                    inbound_workflow_id=None,
+                )
             )
             await session.execute(stmt_clone)
             await session.commit()

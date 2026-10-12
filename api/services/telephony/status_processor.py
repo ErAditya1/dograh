@@ -139,6 +139,8 @@ async def _process_status_update(workflow_run_id: int, status: StatusCallbackReq
         )
 
         await campaign_call_dispatcher.release_call_slot(workflow_run_id)
+        from api.services.call_concurrency import call_concurrency
+        await call_concurrency.unregister_active_call(workflow_run_id)
 
         if workflow_run.campaign_id:
             await circuit_breaker.record_and_evaluate(
@@ -208,6 +210,8 @@ async def _process_status_update(workflow_run_id: int, status: StatusCallbackReq
         )
 
         await campaign_call_dispatcher.release_call_slot(workflow_run_id)
+        from api.services.call_concurrency import call_concurrency
+        await call_concurrency.unregister_active_call(workflow_run_id)
 
         if workflow_run.campaign_id:
             is_failure = normalized_status in FAILURE_NOT_CONNECTED_STATUSES

@@ -7,7 +7,7 @@ calls directly after registration without having to connect a carrier account fi
 
 from typing import Dict, List
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from api.db import db_client
 from api.db.models import TelephonyConfigurationModel, TelephonyPhoneNumberModel
@@ -34,7 +34,7 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
             .where(
                 TelephonyPhoneNumberModel.is_platform_inventory == True,
                 TelephonyPhoneNumberModel.is_active == True,
-                TelephonyPhoneNumberModel.pool_type == "shared_trial",
+                TelephonyPhoneNumberModel.pool_type.in_(["shared_trial", "shared_multi_org"]),
                 TelephonyConfigurationModel.inactive == False,
             )
             .order_by(TelephonyPhoneNumberModel.created_at)
@@ -103,13 +103,24 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
                     org_cfg.inactive = source_cfg.inactive
                     changed = True
 
-            # Check if this config already has any active default caller ID
+            # Clear default caller flag on any inactive numbers for this configuration
+            # to prevent unique index (uq_phone_numbers_default_caller) violations
+            await session.execute(
+                update(TelephonyPhoneNumberModel)
+                .where(
+                    TelephonyPhoneNumberModel.telephony_configuration_id == org_cfg.id,
+                    TelephonyPhoneNumberModel.is_active == False,
+                    TelephonyPhoneNumberModel.is_default_caller_id == True,
+                )
+                .values(is_default_caller_id=False)
+            )
+
+            # Check if this config already has any default caller ID
             has_default_caller = (
                 await session.execute(
                     select(TelephonyPhoneNumberModel.id).where(
                         TelephonyPhoneNumberModel.telephony_configuration_id == org_cfg.id,
                         TelephonyPhoneNumberModel.is_default_caller_id == True,
-                        TelephonyPhoneNumberModel.is_active == True,
                     )
                 )
             ).first() is not None
@@ -133,9 +144,10 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
                         label=num.label or f"Platform Test {num.address}",
                         is_active=True,
                         is_default_caller_id=not has_default_caller,
-                        pool_type="shared_trial",
+                        pool_type=num.pool_type or "shared_trial",
                         is_platform_inventory=False,
                         monthly_price_cents=0,
+                        extra_metadata=dict(num.extra_metadata or {}),
                     )
                     session.add(org_num)
                     changed = True
@@ -145,11 +157,14 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
                     if (
                         org_num.telephony_configuration_id != org_cfg.id
                         or not org_num.is_active
-                        or org_num.pool_type != "shared_trial"
+                        or org_num.pool_type != (num.pool_type or "shared_trial")
                     ):
                         org_num.telephony_configuration_id = org_cfg.id
                         org_num.is_active = True
-                        org_num.pool_type = "shared_trial"
+                        org_num.pool_type = num.pool_type or "shared_trial"
+                        changed = True
+                    if num.extra_metadata and org_num.extra_metadata != num.extra_metadata:
+                        org_num.extra_metadata = dict(num.extra_metadata or {})
                         changed = True
                     if not has_default_caller and not org_num.is_default_caller_id:
                         org_num.is_default_caller_id = True

@@ -186,16 +186,16 @@ async def report_workflow_run_platform_usage(workflow_run) -> None:
             cost_info.update(
                 {
                     "total_cost_usd": cost_usd,
-                    "charge_usd": billing_result["wallet_cost_usd"],
+                    "charge_usd": billing_result.get("wallet_cost_usd", 0.0),
                     "call_duration_seconds": duration_seconds,
                     "rate_per_minute": rate_per_min,
                     "rates": rates,
-                    "charged_to": billing_result["charged_to"],
+                    "charged_to": billing_result.get("charged_to", "wallet"),
                     "plan_credits_deducted": billing_result.get("plan_credits_deducted", 0.0),
                     "plan_credits_remaining": billing_result.get("plan_credits_remaining", 0.0),
-                    "wallet_cost_usd": billing_result["wallet_cost_usd"],
-                    "effective_tier": billing_result["effective_tier"],
-                    "wallet_balance_after": billing_result["wallet_balance_after"],
+                    "wallet_cost_usd": billing_result.get("wallet_cost_usd", 0.0),
+                    "effective_tier": billing_result.get("effective_tier", "pay_as_you_go"),
+                    "wallet_balance_after": billing_result.get("wallet_balance_after", 0.0),
                 }
             )
 
@@ -205,14 +205,14 @@ async def report_workflow_run_platform_usage(workflow_run) -> None:
                 )
 
             logger.info(
-                "Usage recorded for run {} ({}s at ${}/min, charged to {}): plan_mins_deducted={}, wallet_charge=${}, balance_after={}",
+                "Usage recorded for run {} ({}s at ${}/min, charged to {}): plan_credits_deducted={}, wallet_charge=${}, balance_after={}",
                 workflow_run.id,
                 duration_seconds,
                 rate_per_min,
-                billing_result["charged_to"],
-                billing_result["plan_minutes_deducted"],
-                billing_result["wallet_cost_usd"],
-                billing_result["wallet_balance_after"],
+                billing_result.get("charged_to", "wallet"),
+                billing_result.get("plan_credits_deducted", 0.0),
+                billing_result.get("wallet_cost_usd", 0.0),
+                billing_result.get("wallet_balance_after", 0.0),
             )
         except Exception as e:
             logger.warning(
