@@ -39,7 +39,7 @@ from pipecat.services.settings import LLMSettings
 from pipecat.utils.enums import EndTaskReason
 
 from api.db import db_client
-from api.enums import ToolCategory
+from api.enums import ToolCategory, WorkflowRunMode
 from api.errors.failure import (
     classify_exception,
     failure_metadata_for_processor,
@@ -647,6 +647,7 @@ class PipecatEngine:
                     organization_id=organization_id,
                     date_str=date_str,
                 )
+                logger.info(f"check_available_slots result: {res}")
                 await params.result_callback(res)
             except Exception as e:
                 logger.error(f"check_available_slots failed: {e}")

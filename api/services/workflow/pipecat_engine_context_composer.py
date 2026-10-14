@@ -65,6 +65,30 @@ NATIVE_CALENDAR_PROMPT_DIRECTIVES = """\
   6. To see available open times for any day, execute 'check_available_slots(date)'.
 """
 
+HINDI_TTS_SPOKEN_DIRECTIVES = """\
+### HINDI & HINGLISH VOICE (TTS) PHONETIC & CONVERSATIONAL RULES:
+- LANGUAGE MATCHING: If the user speaks in Hindi or Hinglish, ALWAYS respond in natural, friendly Hindi. If in English, respond in English.
+- SCRIPT & PRONUNCIATION FOR HINDI:
+  1. ALWAYS write Hindi in Devanagari script (e.g., 'नमस्ते! बताइए मैं आपकी क्या सहायता कर सकता हूँ?').
+  2. ENGLISH LOANWORDS IN DEVANAGARI: For common English words used in daily Hindi conversations (such as appointment, confirm, doctor, clinic, slot, time, date, cancel, details), DO NOT write them using English Latin letters. Instead, write their phonetic sound directly in Devanagari script so the TTS engine pronounces them naturally without stuttering or spelling them out:
+     - Write 'अपॉइंटमेंट' instead of 'appointment'
+     - Write 'कन्फर्म' instead of 'confirm'
+     - Write 'डॉक्टर' instead of 'doctor'
+     - Write 'क्लिनिक' instead of 'clinic'
+     - Write 'स्लॉट' instead of 'slot'
+     - Write 'टाइम' instead of 'time'
+     - Write 'कैंसिल' instead of 'cancel'
+     - Write 'डिटेल्स' instead of 'details'
+  3. SPOKEN TIME & NUMBERS:
+     - NEVER output '4:00 PM' or '4pm' -> Write 'शाम 4 बजे' or 'चार बजे'.
+     - NEVER output '11:00 AM' -> Write 'सुबह 11 बजे'.
+     - Phone numbers: When speaking or repeating a phone number, group digits with spaces (e.g. '94 73 77 43 90') so TTS reads digits instead of large numbers.
+  4. NATURAL SPOKEN TONE (NO LITERAL BOOKISH TRANSLATIONS):
+     - Speak like a helpful, polite Indian receptionist.
+     - Avoid stiff bookish sentences (e.g. avoid 'आपकी यात्रा का क्या प्रयोजन है?', say 'जी, आप किस समस्या के लिए डॉक्टर को दिखाना चाहते हैं?').
+     - Keep responses concise: 1 to 2 spoken sentences per turn.
+"""
+
 
 def compose_system_prompt_for_node(
     *,
@@ -124,6 +148,24 @@ def compose_system_prompt_for_node(
         for kw in ["### APPOINTMENT", "### NATIVE CALENDAR", "STRICT ANTI-HALLUCINATION"]
     ):
         parts.append(NATIVE_CALENDAR_PROMPT_DIRECTIVES)
+
+    # Automatically append Hindi TTS phonetic directives if Hindi/Hinglish or Indian context is detected
+    has_hindi_intent = (
+        any("\u0900" <= ch <= "\u097f" for ch in formatted_node_prompt)
+        or any(
+            kw in prompt_lower
+            for kw in [
+                "hindi",
+                "hinglish",
+                "namaste",
+                "clinic",
+                "bilingual",
+                "indian",
+            ]
+        )
+    )
+    if has_hindi_intent and "### HINDI & HINGLISH VOICE" not in formatted_node_prompt:
+        parts.append(HINDI_TTS_SPOKEN_DIRECTIVES)
 
     return ComposedNodePrompt(
         text="\n\n".join(parts), recording_enabled=recording_enabled

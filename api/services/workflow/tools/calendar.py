@@ -171,22 +171,40 @@ async def execute_check_available_slots(
         target_date = _parse_date_str(date_str, tz)
         res = await calendar_booking_service.get_available_slots(organization_id, target_date)
         all_slots = res.get("slots", [])
-        open_slots = [s["start"] for s in all_slots if s.get("available")]
+        open_slots: List[str] = []
+        for s in all_slots:
+            st = ""
+            if isinstance(s, dict):
+                st = s.get("start_time") or s.get("start") or ""
+            else:
+                st = getattr(s, "start_time", None) or getattr(s, "start", "")
+            if st:
+                try:
+                    parts = st.split(":")
+                    dt_time = dtime(int(parts[0]), int(parts[1]))
+                    formatted_st = dt_time.strftime("%I:%M %p").lstrip("0")
+                except Exception:
+                    formatted_st = st
+                open_slots.append(formatted_st)
 
+        tz_name = res.get("timezone") or getattr(settings, "timezone", "Asia/Kolkata")
+        slots_preview = ", ".join(open_slots[:6])
         return {
             "success": True,
             "date": target_date.isoformat(),
-            "timezone": res.get("timezone", settings.timezone),
+            "timezone": tz_name,
+            "count": len(open_slots),
             "available_slots": open_slots,
             "message": (
-                f"Available slots for {target_date.isoformat()}: {', '.join(open_slots[:10])}"
+                f"There are {len(open_slots)} open slot(s) on {target_date.isoformat()} ({tz_name}): {slots_preview}. "
+                f"Offer these available times to the customer and ask which time they would prefer."
                 if open_slots
-                else f"No open slots available for {target_date.isoformat()}."
+                else f"No open slots available for {target_date.isoformat()} in schedule."
             ),
         }
     except Exception as e:
         logger.error(f"Error checking available slots for org {organization_id}: {e}")
-        return {"success": False, "error": str(e), "available_slots": []}
+        return {"success": False, "error": str(e), "available_slots": [], "message": f"Error checking calendar: {e}"}
 
 
 async def execute_book_appointment(
@@ -256,18 +274,22 @@ async def execute_book_appointment(
         )
 
         formatted_time = target_time.strftime("%I:%M %p").lstrip("0")
+        appt_id = getattr(appt, "id", None)
+        c_name = getattr(appt, "customer_name", customer_name)
+        m_link = getattr(appt, "meeting_link", None)
+        tz_name = getattr(settings, "timezone", "Asia/Kolkata")
         return {
             "success": True,
             "status": "confirmed",
-            "appointment_id": appt.id,
-            "customer_name": appt.customer_name,
+            "appointment_id": appt_id,
+            "customer_name": c_name,
             "date": target_date.isoformat(),
             "time": formatted_time,
-            "timezone": settings.timezone,
-            "meeting_link": appt.meeting_link,
+            "timezone": tz_name,
+            "meeting_link": m_link,
             "message": (
-                f"Appointment successfully booked for {appt.customer_name} on "
-                f"{target_date.isoformat()} at {formatted_time} ({settings.timezone})."
+                f"Appointment successfully booked for {c_name} on "
+                f"{target_date.isoformat()} at {formatted_time} ({tz_name})."
             ),
         }
     except ValueError as ve:

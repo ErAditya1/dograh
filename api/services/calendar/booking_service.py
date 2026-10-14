@@ -164,6 +164,9 @@ class CalendarBookingService:
                 raise ValueError("Selected slot is already booked. Please choose another time.")
 
             ics_uid = str(uuid.uuid4())
+            meeting_title_tmpl = settings.meeting_title_template or "Consultation with {lead_name}"
+            meeting_link_val = meeting_link or settings.static_meeting_url
+
             appt = ScheduledAppointmentModel(
                 organization_id=organization_id,
                 campaign_id=campaign_id,
@@ -176,14 +179,14 @@ class CalendarBookingService:
                 scheduled_end=scheduled_end,
                 status="confirmed",
                 notes=notes,
-                meeting_link=meeting_link or settings.static_meeting_url,
+                meeting_link=meeting_link_val,
                 ics_uid=ics_uid,
             )
             session.add(appt)
             await session.commit()
             await session.refresh(appt)
 
-            title = settings.meeting_title_template.replace("{lead_name}", customer_name)
+            title = meeting_title_tmpl.replace("{lead_name}", customer_name)
             desc = f"Callio AI Appointment with {customer_name}.\nPhone: {customer_phone}"
             if notes:
                 desc += f"\nNotes: {notes}"
@@ -199,6 +202,8 @@ class CalendarBookingService:
                 attendee_name=customer_name,
             )
 
+            # Safely expunge to prevent MissingGreenlet on attribute access after session close
+            session.expunge(appt)
             return appt, ics_content
 
     async def list_appointments(
@@ -280,7 +285,10 @@ class CalendarBookingService:
                 .limit(limit)
             )
             result = await session.execute(stmt)
-            return list(result.scalars().all())
+            appts = list(result.scalars().all())
+            for a in appts:
+                session.expunge(a)
+            return appts
 
 
 calendar_booking_service = CalendarBookingService()
