@@ -1,5 +1,6 @@
+import re
 import uuid
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 from loguru import logger
@@ -238,6 +239,48 @@ class CalendarBookingService:
             total = len(count_res.scalars().all())
 
             return appointments, total
+
+    async def lookup_appointments(
+        self,
+        organization_id: int,
+        customer_phone: Optional[str] = None,
+        customer_name: Optional[str] = None,
+        target_date: Optional[date] = None,
+        limit: int = 5,
+    ) -> List[ScheduledAppointmentModel]:
+        """Look up existing scheduled appointments matching phone number, name, or date."""
+        async with async_session() as session:
+            conditions = [ScheduledAppointmentModel.organization_id == organization_id]
+
+            if customer_phone:
+                clean_digits = re.sub(r"[^\d]", "", customer_phone)
+                if len(clean_digits) >= 10:
+                    last_10 = clean_digits[-10:]
+                    conditions.append(ScheduledAppointmentModel.customer_phone.like(f"%{last_10}%"))
+                elif clean_digits:
+                    conditions.append(ScheduledAppointmentModel.customer_phone.like(f"%{clean_digits}%"))
+
+            if customer_name and not customer_phone:
+                conditions.append(ScheduledAppointmentModel.customer_name.ilike(f"%{customer_name.strip()}%"))
+
+            if target_date:
+                day_start = datetime.combine(target_date, dtime.min).replace(tzinfo=UTC)
+                day_end = datetime.combine(target_date, dtime.max).replace(tzinfo=UTC)
+                conditions.append(
+                    and_(
+                        ScheduledAppointmentModel.scheduled_start >= day_start,
+                        ScheduledAppointmentModel.scheduled_start <= day_end,
+                    )
+                )
+
+            stmt = (
+                select(ScheduledAppointmentModel)
+                .where(and_(*conditions))
+                .order_by(ScheduledAppointmentModel.scheduled_start.desc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
 
 
 calendar_booking_service = CalendarBookingService()

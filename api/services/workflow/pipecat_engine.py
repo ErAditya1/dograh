@@ -620,6 +620,7 @@ class PipecatEngine:
         from api.services.workflow.tools.calendar import (
             execute_book_appointment,
             execute_check_available_slots,
+            execute_lookup_appointment,
         )
 
         async def book_appointment_func(params: FunctionCallParams) -> None:
@@ -653,11 +654,30 @@ class PipecatEngine:
                     {"success": False, "error": str(e), "available_slots": []}
                 )
 
+        async def lookup_appointment_func(params: FunctionCallParams) -> None:
+            logger.info(f"LLM Function Call EXECUTED: lookup_appointment with arguments: {params.arguments}")
+            try:
+                res = await execute_lookup_appointment(
+                    organization_id=organization_id,
+                    args=params.arguments,
+                    context_vars=self._call_context_vars,
+                )
+                logger.info(f"lookup_appointment result: {res}")
+                await params.result_callback(res)
+            except Exception as e:
+                logger.error(f"lookup_appointment failed: {e}")
+                await params.result_callback(
+                    {"success": False, "found": False, "error": str(e), "message": "Failed to look up appointment."}
+                )
+
         agent.llm.register_function(
             "book_appointment", agent.bind_tool(self, book_appointment_func)
         )
         agent.llm.register_function(
             "check_available_slots", agent.bind_tool(self, check_available_slots_func)
+        )
+        agent.llm.register_function(
+            "lookup_appointment", agent.bind_tool(self, lookup_appointment_func)
         )
 
     async def _register_call_forwarding_function(
@@ -970,12 +990,29 @@ class PipecatEngine:
         node_prompt = getattr(node, "prompt", "") or ""
         ctx = self._call_context_vars or {}
 
-        # 1. Calendar booking functions (active from node config, prompt directives, or campaign context)
+        # 1. Calendar booking functions (active from node config, prompt directives, campaign context, or calendar keywords)
+        prompt_lower = node_prompt.lower()
+        has_calendar_keyword = any(
+            kw in prompt_lower
+            for kw in [
+                "appointment",
+                "book_appointment",
+                "schedule doctor",
+                "receptionist",
+                "clinic",
+                "calendar booking",
+                "check_available_slots",
+                "lookup_appointment",
+                "check appointment",
+            ]
+        )
         calendar_enabled = (
             getattr(node, "calendar_booking_enabled", False)
             or bool(ctx.get("calendar_booking_enabled", False))
             or "APPOINTMENT / CALENDAR SCHEDULING" in node_prompt
+            or "NATIVE CALENDAR" in node_prompt
             or "book_appointment" in node_prompt
+            or has_calendar_keyword
         )
         if calendar_enabled:
             await self._register_calendar_functions(agent=agent)

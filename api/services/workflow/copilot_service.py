@@ -743,13 +743,20 @@ async def generate_workflow_from_template_llm(
         and any(kw in user_text.lower() for kw in ["# ", "identity:", "role:", "system prompt:", "rules:", "use case:"])
     )
 
+    has_calendar_intent = any(
+        kw in (use_case + " " + activity_description).lower()
+        for kw in ["appointment", "booking", "schedule", "receptionist", "clinic", "calendar", "consultation"]
+    )
+
     for node in wf_def.get("nodes", []):
-        if node.get("type") == "agentNode":
+        if node.get("type") in ("agentNode", "startCall"):
             if is_preformatted_system_prompt:
                 node.setdefault("data", {})["prompt"] = user_text
             elif not node.get("data", {}).get("prompt") or len(node.get("data", {}).get("prompt", "")) < 100:
                 if resp.workflow_draft.system_prompt:
                     node.setdefault("data", {})["prompt"] = resp.workflow_draft.system_prompt
+            if has_calendar_intent:
+                node.setdefault("data", {})["calendar_booking_enabled"] = True
             # Clear arbitrary tools unless explicitly mentioned
             node.setdefault("data", {})["tool_uuids"] = []
 

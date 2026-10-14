@@ -2441,15 +2441,17 @@ async def create_custom_agent(
             )
 
         if request.calendar_booking_enabled:
-            cal_url_note = f"\n- Meeting booking calendar URL: {request.calendar_url}" if request.calendar_url else ""
+            cal_url = (request.calendar_url or "").strip()
+            cal_url_note = f"\n- External meeting booking link: {cal_url} (Only provide this link if the customer requests an external web link)." if cal_url else "\n- Native platform calendar is active. Do NOT ask the user to open any external website."
             prompt_sections.append(
-                f"\n\n### APPOINTMENT / CALENDAR SCHEDULING:\n"
-                f"- You have access to real calendar tools: 'check_available_slots' and 'book_appointment'.\n"
-                f"- When the customer wants to book, schedule, or reschedule an appointment, meeting, or demo:\n"
-                f"  1. Confirm their preferred date and time (and their name/phone if not already available).\n"
-                f"  2. You can check available open times for a date using the 'check_available_slots' tool.\n"
-                f"  3. ALWAYS execute the 'book_appointment' tool to record and confirm the appointment in the calendar.\n"
-                f"  4. Once booked, confirm the appointment time to the customer."
+                f"\n\n### NATIVE CALENDAR & APPOINTMENT INSTRUCTIONS (STRICT ANTI-HALLUCINATION RULES):\n"
+                f"- You have direct access to native platform calendar tools: 'check_available_slots', 'book_appointment', and 'lookup_appointment'.\n"
+                f"- When a customer wants to check open slots: call 'check_available_slots(date)'.\n"
+                f"- When a customer wants to book/schedule: confirm preferred date, time, name and phone, then call 'book_appointment'.\n"
+                f"- When a customer says they already booked or asks for status: ALWAYS call 'lookup_appointment' first with their phone number or name. NEVER claim they have a confirmed booking without looking it up!\n"
+                f"- If 'lookup_appointment' finds no booking, tell the customer truthfully and offer to schedule one.\n"
+                f"- NEVER claim an appointment is booked or confirmed until 'book_appointment' returns success.\n"
+                f"- NEVER pretend to send WhatsApp/SMS confirmations. Share the confirmed booking ID directly in conversation."
                 f"{cal_url_note}"
             )
 
@@ -2563,15 +2565,17 @@ async def update_custom_agent(
             )
 
         if request.calendar_booking_enabled:
-            cal_url_note = f"\n- Meeting booking calendar URL: {request.calendar_url}" if request.calendar_url else ""
+            cal_url = (request.calendar_url or "").strip()
+            cal_url_note = f"\n- External meeting booking link: {cal_url} (Only provide this link if the customer requests an external web link)." if cal_url else "\n- Native platform calendar is active. Do NOT ask the user to open any external website."
             prompt_sections.append(
-                f"\n\n### APPOINTMENT / CALENDAR SCHEDULING:\n"
-                f"- You have access to real calendar tools: 'check_available_slots' and 'book_appointment'.\n"
-                f"- When the customer wants to book, schedule, or reschedule an appointment, meeting, or demo:\n"
-                f"  1. Confirm their preferred date and time (and their name/phone if not already available).\n"
-                f"  2. You can check available open times for a date using the 'check_available_slots' tool.\n"
-                f"  3. ALWAYS execute the 'book_appointment' tool to record and confirm the appointment in the calendar.\n"
-                f"  4. Once booked, confirm the appointment time to the customer."
+                f"\n\n### NATIVE CALENDAR & APPOINTMENT INSTRUCTIONS (STRICT ANTI-HALLUCINATION RULES):\n"
+                f"- You have direct access to native platform calendar tools: 'check_available_slots', 'book_appointment', and 'lookup_appointment'.\n"
+                f"- When a customer wants to check open slots: call 'check_available_slots(date)'.\n"
+                f"- When a customer wants to book/schedule: confirm preferred date, time, name and phone, then call 'book_appointment'.\n"
+                f"- When a customer says they already booked or asks for status: ALWAYS call 'lookup_appointment' first with their phone number or name. NEVER claim they have a confirmed booking without looking it up!\n"
+                f"- If 'lookup_appointment' finds no booking, tell the customer truthfully and offer to schedule one.\n"
+                f"- NEVER claim an appointment is booked or confirmed until 'book_appointment' returns success.\n"
+                f"- NEVER pretend to send WhatsApp/SMS confirmations. Share the confirmed booking ID directly in conversation."
                 f"{cal_url_note}"
             )
 

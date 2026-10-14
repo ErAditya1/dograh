@@ -73,6 +73,34 @@ def get_calendar_tools() -> List[Dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup_appointment",
+                "description": (
+                    "Look up, search, or verify existing scheduled appointments on the calendar using the customer's phone number, name, or date. "
+                    "ALWAYS call this tool whenever a customer asks about their booking status, asks if they have an appointment, or provides their phone number to check their slot."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "customer_phone": {
+                            "type": "string",
+                            "description": "Customer phone number to search for (e.g., '9473774390', '+919473774390').",
+                        },
+                        "customer_name": {
+                            "type": "string",
+                            "description": "Optional customer name to help locate the appointment.",
+                        },
+                        "date": {
+                            "type": "string",
+                            "description": "Optional date in YYYY-MM-DD format or 'today'/'tomorrow' to check appointments on a specific day.",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
     ]
 
 
@@ -262,3 +290,94 @@ async def execute_book_appointment(
             "error": str(e),
             "message": f"Could not schedule appointment due to an error: {e}",
         }
+
+
+async def execute_lookup_appointment(
+    organization_id: int,
+    args: Dict[str, Any],
+    context_vars: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Look up existing scheduled appointments for customer by phone number, name, or date."""
+    ctx = context_vars or {}
+    try:
+        settings = await calendar_booking_service.get_or_create_settings(organization_id)
+        try:
+            tz = ZoneInfo(settings.timezone)
+        except Exception:
+            tz = ZoneInfo("Asia/Kolkata")
+
+        phone = (
+            args.get("customer_phone")
+            or ctx.get("to_phone")
+            or ctx.get("from_phone")
+            or ctx.get("phone")
+            or ctx.get("customer_phone")
+        )
+        if phone:
+            phone = str(phone).strip()
+
+        name = args.get("customer_name") or ctx.get("lead_name") or ctx.get("name")
+        if name:
+            name = str(name).strip()
+
+        raw_date = args.get("date")
+        target_date = _parse_date_str(str(raw_date), tz) if raw_date else None
+
+        appts = await calendar_booking_service.lookup_appointments(
+            organization_id=organization_id,
+            customer_phone=phone,
+            customer_name=name,
+            target_date=target_date,
+        )
+
+        if not appts:
+            return {
+                "success": True,
+                "found": False,
+                "count": 0,
+                "appointments": [],
+                "message": (
+                    f"No scheduled appointments found in the calendar for phone '{phone or 'any'}' "
+                    f"under name '{name or 'any'}'. Please politely inform the customer that no appointment was found under their number, and offer to schedule a new appointment."
+                ),
+            }
+
+        appt_list = []
+        for a in appts:
+            local_dt = (
+                a.scheduled_start.astimezone(tz)
+                if a.scheduled_start.tzinfo
+                else a.scheduled_start.replace(tzinfo=UTC).astimezone(tz)
+            )
+            date_str = local_dt.strftime("%Y-%m-%d")
+            time_str = local_dt.strftime("%I:%M %p").lstrip("0")
+            appt_list.append({
+                "id": a.id,
+                "customer_name": a.customer_name,
+                "customer_phone": a.customer_phone,
+                "date": date_str,
+                "time": time_str,
+                "status": a.status,
+                "notes": a.notes or "",
+            })
+
+        first = appt_list[0]
+        return {
+            "success": True,
+            "found": True,
+            "count": len(appt_list),
+            "appointments": appt_list,
+            "message": (
+                f"Found {len(appt_list)} appointment(s) in system. Booking ID #{first['id']} "
+                f"for {first['customer_name']} on {first['date']} at {first['time']} ({settings.timezone}), status: {first['status']}."
+            ),
+        }
+    except Exception as e:
+        logger.error(f"Error looking up appointments for org {organization_id}: {e}")
+        return {
+            "success": False,
+            "found": False,
+            "error": str(e),
+            "message": f"Could not look up appointment due to an error: {e}",
+        }
+

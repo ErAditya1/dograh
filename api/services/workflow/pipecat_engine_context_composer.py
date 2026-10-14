@@ -53,6 +53,19 @@ class ComposedNodePrompt:
     recording_enabled: bool
 
 
+NATIVE_CALENDAR_PROMPT_DIRECTIVES = """\
+### NATIVE CALENDAR & APPOINTMENT INSTRUCTIONS (STRICT ANTI-HALLUCINATION RULES):
+- You have direct access to native platform calendar tools: 'check_available_slots', 'book_appointment', and 'lookup_appointment'.
+- STRICT RULES AGAINST HALLUCINATION:
+  1. NEVER claim, assume, or hallucinate that an appointment is booked or confirmed until you execute 'book_appointment' and receive success=true with an appointment_id.
+  2. When a customer says they already booked, asks about their appointment, or provides their phone number/name: ALWAYS call 'lookup_appointment' first. DO NOT claim they have an appointment without looking it up!
+  3. If 'lookup_appointment' returns no appointments (found=false), tell the customer politely that no appointment was found for their details, and offer to schedule a new one.
+  4. If an appointment is found or booked, inform the customer with the actual booking ID, date, time, and status from the tool result.
+  5. NEVER promise that a WhatsApp, SMS, or external message has been sent unless an actual messaging tool was executed. Always provide the booking ID directly in the conversation.
+  6. To see available open times for any day, execute 'check_available_slots(date)'.
+"""
+
+
 def compose_system_prompt_for_node(
     *,
     node: "Node",
@@ -86,6 +99,31 @@ def compose_system_prompt_for_node(
     recording_enabled = has_recordings and "RECORDING_ID:" in formatted_node_prompt
     if recording_enabled:
         parts.append(RECORDING_RESPONSE_MODE_INSTRUCTIONS)
+
+    # Automatically append strict calendar directives if calendar booking is enabled or calendar intent is present
+    prompt_lower = formatted_node_prompt.lower()
+    has_calendar_intent = (
+        getattr(node, "calendar_booking_enabled", False)
+        or any(
+            kw in prompt_lower
+            for kw in [
+                "appointment",
+                "book_appointment",
+                "schedule doctor",
+                "receptionist",
+                "clinic",
+                "calendar booking",
+                "check_available_slots",
+                "lookup_appointment",
+                "check appointment",
+            ]
+        )
+    )
+    if has_calendar_intent and not any(
+        kw in formatted_node_prompt
+        for kw in ["### APPOINTMENT", "### NATIVE CALENDAR", "STRICT ANTI-HALLUCINATION"]
+    ):
+        parts.append(NATIVE_CALENDAR_PROMPT_DIRECTIVES)
 
     return ComposedNodePrompt(
         text="\n\n".join(parts), recording_enabled=recording_enabled
@@ -141,13 +179,30 @@ async def compose_functions_for_node(
         )
         functions.append(function_schema)
 
-    # Calendar booking tools (when enabled on node, in campaign context, or present in system prompt)
+    # Calendar booking tools (when enabled on node, in campaign context, or present in system prompt/keywords)
     node_prompt = getattr(node, "prompt", "") or ""
+    prompt_lower = node_prompt.lower()
+    has_calendar_keyword = any(
+        kw in prompt_lower
+        for kw in [
+            "appointment",
+            "book_appointment",
+            "schedule doctor",
+            "receptionist",
+            "clinic",
+            "calendar booking",
+            "check_available_slots",
+            "lookup_appointment",
+            "check appointment",
+        ]
+    )
     if (
         getattr(node, "calendar_booking_enabled", False)
         or bool(ctx.get("calendar_booking_enabled", False))
         or "APPOINTMENT / CALENDAR SCHEDULING" in node_prompt
+        or "NATIVE CALENDAR" in node_prompt
         or "book_appointment" in node_prompt
+        or has_calendar_keyword
     ):
         from api.services.workflow.tools.calendar import get_calendar_tools
         for tool_def in get_calendar_tools():
@@ -157,7 +212,7 @@ async def compose_functions_for_node(
                     func["name"],
                     func["description"],
                     properties=func["parameters"]["properties"],
-                    required=func["parameters"]["required"],
+                    required=func["parameters"].get("required", []),
                 )
             )
 
