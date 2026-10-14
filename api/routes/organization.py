@@ -373,6 +373,15 @@ async def _model_configuration_v2_response(
 async def get_model_configuration_v2_defaults(
     user: UserModel = Depends(get_user_with_selected_organization),
 ):
+    from copy import deepcopy
+    from api.services.platform_keys import _MASTER_KEYS_CACHE, refresh_master_keys_cache
+
+    if not _MASTER_KEYS_CACHE.get("tts"):
+        try:
+            await refresh_master_keys_cache()
+        except Exception:
+            pass
+
     byok_default_providers = {
         service: provider
         for service, provider in DEFAULT_SERVICE_PROVIDERS.items()
@@ -384,29 +393,65 @@ async def get_model_configuration_v2_defaults(
         "stt": {},
         "tts": {},
     }
+    default_models: dict[str, str] = {}
+    default_voices: dict[str, str] = {}
+
     try:
-        from api.services.platform_keys import _MASTER_KEYS_CACHE
         for s_type, prov_map in _MASTER_KEYS_CACHE.items():
             st_lower = s_type.lower()
             if st_lower not in master_keys_summary:
                 master_keys_summary[st_lower] = {}
             for prov, data in prov_map.items():
+                p_lower = prov.lower()
                 is_def = bool(data.get("is_default"))
                 def_m = data.get("default_model")
-                master_keys_summary[st_lower][prov.lower()] = {
+                def_v = data.get("default_voice")
+                master_keys_summary[st_lower][p_lower] = {
                     "is_default": is_def,
                     "default_model": def_m,
+                    "default_voice": def_v,
                     "models_pricing": data.get("models_pricing") or {},
                 }
                 # If platform has a default master key for this service, update byok_default_providers
                 if is_def:
-                    byok_default_providers[st_lower] = prov.lower()
+                    byok_default_providers[st_lower] = p_lower
+                    if def_m:
+                        default_models[st_lower] = def_m
+                    if def_v:
+                        default_voices[st_lower] = def_v
+
+            # If no provider explicitly marked default, pick first configured master key
+            if st_lower not in default_models and prov_map:
+                first_prov = next(iter(prov_map))
+                byok_default_providers[st_lower] = first_prov.lower()
+                if prov_map[first_prov].get("default_model"):
+                    default_models[st_lower] = prov_map[first_prov]["default_model"]
+                if prov_map[first_prov].get("default_voice"):
+                    default_voices[st_lower] = prov_map[first_prov]["default_voice"]
     except Exception as e:
         logger.warning("Could not load master keys cache for defaults: {}", e)
 
+    llm_schemas = deepcopy(_byok_provider_schemas(ServiceType.LLM))
+    tts_schemas = deepcopy(_byok_provider_schemas(ServiceType.TTS))
+    stt_schemas = deepcopy(_byok_provider_schemas(ServiceType.STT))
+    embeddings_schemas = deepcopy(_byok_provider_schemas(ServiceType.EMBEDDINGS))
+    realtime_schemas = deepcopy(_byok_provider_schemas(ServiceType.REALTIME))
+
+    # Patch schema property defaults with platform master key configured default model and voice
+    for s_name, s_map in [("llm", llm_schemas), ("tts", tts_schemas), ("stt", stt_schemas)]:
+        for prov_name, prov_info in master_keys_summary.get(s_name, {}).items():
+            if prov_name in s_map and "properties" in s_map[prov_name]:
+                props = s_map[prov_name]["properties"]
+                if prov_info.get("default_model") and "model" in props:
+                    props["model"]["default"] = prov_info["default_model"]
+                if prov_info.get("default_voice") and "voice" in props:
+                    props["voice"]["default"] = prov_info["default_voice"]
+
+    effective_dograh_voice = default_voices.get("tts") or DOGRAH_DEFAULT_VOICE
+
     return {
         "dograh": {
-            "voices": [DOGRAH_DEFAULT_VOICE],
+            "voices": [effective_dograh_voice] if effective_dograh_voice == DOGRAH_DEFAULT_VOICE else [effective_dograh_voice, DOGRAH_DEFAULT_VOICE],
             "allow_custom_input": _dograh_allows_custom_voice(),
             "speeds": list(DOGRAH_SPEED_OPTIONS),
             "speed_range": {
@@ -417,24 +462,28 @@ async def get_model_configuration_v2_defaults(
             "languages": DOGRAH_STT_LANGUAGES,
             "multilingual_languages": DOGRAH_MULTILINGUAL_AUTODETECT_LANGUAGES,
             "defaults": {
-                "voice": DOGRAH_DEFAULT_VOICE,
+                "voice": effective_dograh_voice,
                 "speed": 1.0,
                 "language": DOGRAH_DEFAULT_LANGUAGE,
             },
         },
         "byok": {
             "pipeline": {
-                "llm": _byok_provider_schemas(ServiceType.LLM),
-                "tts": _byok_provider_schemas(ServiceType.TTS),
-                "stt": _byok_provider_schemas(ServiceType.STT),
-                "embeddings": _byok_provider_schemas(ServiceType.EMBEDDINGS),
+                "llm": llm_schemas,
+                "tts": tts_schemas,
+                "stt": stt_schemas,
+                "embeddings": embeddings_schemas,
                 "default_providers": byok_default_providers,
+                "default_models": default_models,
+                "default_voices": default_voices,
             },
             "realtime": {
-                "realtime": _byok_provider_schemas(ServiceType.REALTIME),
-                "llm": _byok_provider_schemas(ServiceType.LLM),
-                "embeddings": _byok_provider_schemas(ServiceType.EMBEDDINGS),
+                "realtime": realtime_schemas,
+                "llm": llm_schemas,
+                "embeddings": embeddings_schemas,
                 "default_providers": byok_default_providers,
+                "default_models": default_models,
+                "default_voices": default_voices,
             },
         },
         "platform_master_keys": master_keys_summary,

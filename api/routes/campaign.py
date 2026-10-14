@@ -280,6 +280,8 @@ class CreateCampaignRequest(BaseModel):
     call_forwarding_enabled: Optional[bool] = None
     forwarding_phone_number: Optional[str] = None
     forwarding_condition: Optional[str] = None
+    calendar_booking_enabled: Optional[bool] = None
+    calendar_url: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_agent_selection(self):
@@ -771,6 +773,10 @@ async def create_campaign(
         orchestrator_metadata["forwarding_phone_number"] = request.forwarding_phone_number
     if request.forwarding_condition:
         orchestrator_metadata["forwarding_condition"] = request.forwarding_condition
+    if request.calendar_booking_enabled is not None:
+        orchestrator_metadata["calendar_booking_enabled"] = request.calendar_booking_enabled
+    if request.calendar_url:
+        orchestrator_metadata["calendar_url"] = request.calendar_url
 
     campaign = await db_client.create_campaign(
         name=request.name,
@@ -998,6 +1004,8 @@ class TestCallRequest(BaseModel):
     call_forwarding_enabled: Optional[bool] = None
     forwarding_phone_number: Optional[str] = None
     forwarding_condition: Optional[str] = None
+    calendar_booking_enabled: Optional[bool] = None
+    calendar_url: Optional[str] = None
 
 
 @router.post("/test-call")
@@ -1150,6 +1158,8 @@ async def trigger_test_call(
                 call_forwarding_enabled=request.call_forwarding_enabled,
                 forwarding_phone_number=request.forwarding_phone_number,
                 forwarding_condition=request.forwarding_condition,
+                calendar_booking_enabled=request.calendar_booking_enabled,
+                calendar_url=request.calendar_url,
             )
             res = await initiate_call(call_req, user=user)
             return {

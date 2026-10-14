@@ -643,11 +643,15 @@ async def smartflo_direct_stream(
             state=WorkflowRunState.RUNNING.value,
         )
 
+        effective_org_id = workflow.organization_id or (workflow_run.extra or {}).get("organization_id")
+        if not effective_org_id:
+            effective_org_id = await db_client.get_organization_id_by_workflow_run_id(run_id_int)
+
         provider = SmartfloProvider({})
         await provider.handle_websocket(
             websocket=websocket,
             workflow_id=workflow.id,
-            organization_id=workflow.organization_id,
+            organization_id=effective_org_id,
             workflow_run_id=run_id_int,
         )
     except Exception as e:

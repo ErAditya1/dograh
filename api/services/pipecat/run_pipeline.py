@@ -376,16 +376,27 @@ async def _run_pipeline_telephony_impl(
     logger.debug(f"Running {provider_name} pipeline for workflow_run {workflow_run_id}")
     set_current_run_id(workflow_run_id)
 
-    workflow = await db_client.get_workflow(
-        workflow_id, organization_id=organization_id
-    )
-    if not workflow:
-        raise HTTPException(status_code=404, detail="Workflow not found")
-    effective_org_id = organization_id or workflow.organization_id
+    effective_org_id = organization_id
     if not effective_org_id:
         effective_org_id = await db_client.get_organization_id_by_workflow_run_id(
             workflow_run_id
         )
+
+    if effective_org_id:
+        workflow = await db_client.get_workflow(
+            workflow_id, organization_id=effective_org_id
+        )
+    else:
+        workflow = await db_client.get_workflow_by_id(workflow_id)
+
+    if not workflow:
+        workflow = await db_client.get_workflow_by_id(workflow_id)
+
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    if not effective_org_id:
+        effective_org_id = workflow.organization_id
     set_current_org_id(effective_org_id)
 
     ambient_noise_config = None

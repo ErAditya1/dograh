@@ -263,6 +263,10 @@ class CampaignCallDispatcher:
                     initial_context["transfer_destination"] = campaign.orchestrator_metadata["forwarding_phone_number"]
                 if campaign.orchestrator_metadata.get("forwarding_condition"):
                     initial_context["forwarding_condition"] = campaign.orchestrator_metadata["forwarding_condition"]
+                if campaign.orchestrator_metadata.get("calendar_booking_enabled") is not None:
+                    initial_context["calendar_booking_enabled"] = campaign.orchestrator_metadata["calendar_booking_enabled"]
+                if campaign.orchestrator_metadata.get("calendar_url"):
+                    initial_context["calendar_url"] = campaign.orchestrator_metadata["calendar_url"]
                 if campaign.orchestrator_metadata.get("instructions"):
                     initial_context["campaign_instructions"] = campaign.orchestrator_metadata["instructions"]
             run_inputs = await prepare_workflow_run_inputs(

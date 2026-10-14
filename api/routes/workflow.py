@@ -2440,11 +2440,17 @@ async def create_custom_agent(
                 f"- Action: Politely say 'I will transfer you right away to our team specialist. Please hold the line for just a moment.', then forward the call to {request.forwarding_phone_number}."
             )
 
-        if request.calendar_booking_enabled and request.calendar_url:
+        if request.calendar_booking_enabled:
+            cal_url_note = f"\n- Meeting booking calendar URL: {request.calendar_url}" if request.calendar_url else ""
             prompt_sections.append(
                 f"\n\n### APPOINTMENT / CALENDAR SCHEDULING:\n"
-                f"- When the customer wants to schedule or book an appointment, confirm their preferred day and time.\n"
-                f"- Meeting booking calendar URL: {request.calendar_url}"
+                f"- You have access to real calendar tools: 'check_available_slots' and 'book_appointment'.\n"
+                f"- When the customer wants to book, schedule, or reschedule an appointment, meeting, or demo:\n"
+                f"  1. Confirm their preferred date and time (and their name/phone if not already available).\n"
+                f"  2. You can check available open times for a date using the 'check_available_slots' tool.\n"
+                f"  3. ALWAYS execute the 'book_appointment' tool to record and confirm the appointment in the calendar.\n"
+                f"  4. Once booked, confirm the appointment time to the customer."
+                f"{cal_url_note}"
             )
 
         compiled_system_prompt = "\n".join(prompt_sections)
@@ -2556,11 +2562,17 @@ async def update_custom_agent(
                 f"- Action: Politely say 'I will transfer you right away to our team specialist. Please hold the line for just a moment.', then forward the call to {request.forwarding_phone_number}."
             )
 
-        if request.calendar_booking_enabled and request.calendar_url:
+        if request.calendar_booking_enabled:
+            cal_url_note = f"\n- Meeting booking calendar URL: {request.calendar_url}" if request.calendar_url else ""
             prompt_sections.append(
                 f"\n\n### APPOINTMENT / CALENDAR SCHEDULING:\n"
-                f"- When the customer wants to schedule or book an appointment, confirm their preferred day and time.\n"
-                f"- Meeting booking calendar URL: {request.calendar_url}"
+                f"- You have access to real calendar tools: 'check_available_slots' and 'book_appointment'.\n"
+                f"- When the customer wants to book, schedule, or reschedule an appointment, meeting, or demo:\n"
+                f"  1. Confirm their preferred date and time (and their name/phone if not already available).\n"
+                f"  2. You can check available open times for a date using the 'check_available_slots' tool.\n"
+                f"  3. ALWAYS execute the 'book_appointment' tool to record and confirm the appointment in the calendar.\n"
+                f"  4. Once booked, confirm the appointment time to the customer."
+                f"{cal_url_note}"
             )
 
         compiled_system_prompt = "\n".join(prompt_sections)

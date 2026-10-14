@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 import hashlib
 import json
-from typing import Annotated, List, Literal, Optional, TypedDict, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict, Union
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from loguru import logger
@@ -68,6 +68,9 @@ class DefaultConfigurationsResponse(BaseModel):
     embeddings: dict[str, dict]
     realtime: dict[str, dict]
     default_providers: dict[str, str]
+    default_models: Optional[dict[str, str]] = None
+    default_voices: Optional[dict[str, str]] = None
+    platform_master_keys: Optional[dict[str, Any]] = None
     workflow_configurations: WorkflowConfigurationDefaults
     default_call_dispositions: list[CallDispositionOption] = Field(
         description=(
@@ -88,28 +91,94 @@ class DefaultConfigurationsResponse(BaseModel):
 
 @router.get("/configurations/defaults")
 async def get_default_configurations() -> DefaultConfigurationsResponse:
+    from copy import deepcopy
+    from api.services.platform_keys import _MASTER_KEYS_CACHE, refresh_master_keys_cache
+
+    if not _MASTER_KEYS_CACHE.get("tts"):
+        try:
+            await refresh_master_keys_cache()
+        except Exception:
+            pass
+
+    llm_schemas = {
+        provider: deepcopy(model_cls.model_json_schema())
+        for provider, model_cls in REGISTRY[ServiceType.LLM].items()
+    }
+    tts_schemas = {
+        provider: deepcopy(model_cls.model_json_schema())
+        for provider, model_cls in REGISTRY[ServiceType.TTS].items()
+    }
+    stt_schemas = {
+        provider: deepcopy(model_cls.model_json_schema())
+        for provider, model_cls in REGISTRY[ServiceType.STT].items()
+    }
+    embeddings_schemas = {
+        provider: deepcopy(model_cls.model_json_schema())
+        for provider, model_cls in REGISTRY[ServiceType.EMBEDDINGS].items()
+    }
+    realtime_schemas = {
+        provider: deepcopy(model_cls.model_json_schema())
+        for provider, model_cls in REGISTRY[ServiceType.REALTIME].items()
+    }
+
+    effective_default_providers = dict(DEFAULT_SERVICE_PROVIDERS)
+    default_models: dict[str, str] = {}
+    default_voices: dict[str, str] = {}
+    master_keys_summary: dict[str, dict[str, Any]] = {
+        "llm": {},
+        "stt": {},
+        "tts": {},
+    }
+
+    try:
+        for s_type in ("llm", "stt", "tts"):
+            prov_map = _MASTER_KEYS_CACHE.get(s_type, {})
+            target_schemas = {"llm": llm_schemas, "tts": tts_schemas, "stt": stt_schemas}.get(s_type, {})
+            for prov, data in prov_map.items():
+                p_lower = prov.lower()
+                is_def = bool(data.get("is_default"))
+                def_m = data.get("default_model")
+                def_v = data.get("default_voice")
+                master_keys_summary[s_type][p_lower] = {
+                    "is_default": is_def,
+                    "default_model": def_m,
+                    "default_voice": def_v,
+                    "models_pricing": data.get("models_pricing") or {},
+                }
+                if p_lower in target_schemas and "properties" in target_schemas[p_lower]:
+                    props = target_schemas[p_lower]["properties"]
+                    if def_m and "model" in props:
+                        props["model"]["default"] = def_m
+                    if def_v and "voice" in props:
+                        props["voice"]["default"] = def_v
+
+                if is_def:
+                    effective_default_providers[s_type] = p_lower
+                    if def_m:
+                        default_models[s_type] = def_m
+                    if def_v:
+                        default_voices[s_type] = def_v
+
+            if s_type not in default_models and prov_map:
+                first_p = next(iter(prov_map))
+                effective_default_providers[s_type] = first_p.lower()
+                if prov_map[first_p].get("default_model"):
+                    default_models[s_type] = prov_map[first_p]["default_model"]
+                if prov_map[first_p].get("default_voice"):
+                    default_voices[s_type] = prov_map[first_p]["default_voice"]
+    except Exception as e:
+        logger.warning("Error applying master keys to default configurations: {}", e)
+
     configurations = {
-        "llm": {
-            provider: model_cls.model_json_schema()
-            for provider, model_cls in REGISTRY[ServiceType.LLM].items()
-        },
-        "tts": {
-            provider: model_cls.model_json_schema()
-            for provider, model_cls in REGISTRY[ServiceType.TTS].items()
-        },
-        "stt": {
-            provider: model_cls.model_json_schema()
-            for provider, model_cls in REGISTRY[ServiceType.STT].items()
-        },
-        "embeddings": {
-            provider: model_cls.model_json_schema()
-            for provider, model_cls in REGISTRY[ServiceType.EMBEDDINGS].items()
-        },
-        "realtime": {
-            provider: model_cls.model_json_schema()
-            for provider, model_cls in REGISTRY[ServiceType.REALTIME].items()
-        },
-        "default_providers": DEFAULT_SERVICE_PROVIDERS,
+        "llm": llm_schemas,
+        "tts": tts_schemas,
+        "stt": stt_schemas,
+        "embeddings": embeddings_schemas,
+        "realtime": realtime_schemas,
+        "default_providers": effective_default_providers,
+        "default_models": default_models,
+        "default_voices": default_voices,
+        "platform_master_keys": master_keys_summary,
         "workflow_configurations": get_default_workflow_configurations(),
         "default_call_dispositions": get_default_call_disposition_options(),
         "default_answer_classifier_prompt": ANSWER_CLASSIFIER_SYSTEM_PROMPT,
@@ -466,6 +535,7 @@ class VoiceInfo(BaseModel):
     gender: Optional[str] = None
     language: Optional[str] = None
     preview_url: Optional[str] = None
+    is_default: bool = False
 
 
 class SupportedLanguage(BaseModel):
@@ -484,6 +554,8 @@ class VoiceFacets(BaseModel):
 
 class VoicesResponse(BaseModel):
     provider: str
+    default_model: Optional[str] = None
+    default_voice: Optional[str] = None
     voices: List[VoiceInfo]
     facets: Optional[VoiceFacets] = None
     supported_languages: List[SupportedLanguage] = []
@@ -619,24 +691,28 @@ async def get_default_voices(
 ) -> VoicesResponse:
     """
     Get available voices for the admin's configured default TTS provider from Dograh MPS.
-    Automatically resolves the default master provider and model set by the platform admin,
+    Automatically resolves the default master provider, model, and voice set by the platform admin,
     and caches responses in Redis to avoid repetitive MPS requests.
     """
     admin_provider = "cartesia"
     admin_model = model
+    admin_voice = None
     try:
-        from api.services.platform_keys import get_default_platform_provider_and_model
-        default_result = get_default_platform_provider_and_model("tts")
+        from api.services.platform_keys import (
+            get_default_platform_provider_and_settings,
+        )
+        default_result = get_default_platform_provider_and_settings("tts")
         if default_result and default_result[0]:
             admin_provider = default_result[0].lower()
             if not admin_model and default_result[2]:
                 admin_model = default_result[2]
+            admin_voice = default_result[3]
     except Exception as e:
         logger.debug("Could not resolve default platform TTS provider: {}", e)
         admin_provider = DEFAULT_SERVICE_PROVIDERS.get("tts", "cartesia").lower()
 
     try:
-        return await get_voices(
+        res = await get_voices(
             provider=admin_provider,
             model=admin_model,
             language=language,
@@ -646,6 +722,9 @@ async def get_default_voices(
             refresh=refresh,
             user=user,
         )
+        if admin_voice and not res.default_voice:
+            res.default_voice = admin_voice
+        return res
     except Exception as exc:
         if admin_provider != "cartesia":
             logger.warning(
@@ -773,6 +852,20 @@ async def get_voices(
             }
             raw_voices = builtins.get(normalized_provider, get_cartesia_builtin_catalog)()
 
+    # Resolve configured default model and default voice for this provider
+    prov_default_voice = None
+    prov_default_model = model
+    try:
+        from api.services.platform_keys import (
+            get_platform_default_model,
+            get_platform_default_voice,
+        )
+        prov_default_voice = get_platform_default_voice("tts", normalized_provider)
+        if not prov_default_model:
+            prov_default_model = get_platform_default_model("tts", normalized_provider)
+    except Exception as e:
+        logger.debug("Could not resolve default model/voice for provider {}: {}", normalized_provider, e)
+
     # Normalize voice items dynamically
     parsed_voices: list[VoiceInfo] = []
     for item in raw_voices:
@@ -787,6 +880,8 @@ async def get_voices(
         if not v_accent and loc and "-" in str(loc):
             v_accent = str(loc).split("-")[-1].lower()
 
+        is_def_voice = bool(prov_default_voice and v_id.lower() == prov_default_voice.lower())
+
         parsed_voices.append(
             VoiceInfo(
                 voice_id=v_id,
@@ -796,6 +891,7 @@ async def get_voices(
                 language=str(item.get("language") or (loc.split("-")[0] if loc else "en")).lower(),
                 description=item.get("description") or f"{resolved_provider.title()} Voice",
                 preview_url=item.get("preview_url") or item.get("preview_audio") or item.get("sample_audio_url"),
+                is_default=is_def_voice,
             )
         )
 
@@ -821,6 +917,16 @@ async def get_voices(
             continue
         filtered.append(voice)
 
+    # Prioritize the provider's default voice at index 0 if present
+    if prov_default_voice:
+        def_idx = next(
+            (i for i, v in enumerate(filtered) if v.voice_id.lower() == prov_default_voice.lower()),
+            None,
+        )
+        if def_idx is not None and def_idx > 0:
+            def_voice_item = filtered.pop(def_idx)
+            filtered.insert(0, def_voice_item)
+
     # Derive facets dynamically from live voices
     if isinstance(facets_data, dict):
         facets = VoiceFacets(**facets_data)
@@ -840,6 +946,8 @@ async def get_voices(
 
     response = VoicesResponse(
         provider=resolved_provider,
+        default_model=prov_default_model,
+        default_voice=prov_default_voice,
         voices=filtered,
         facets=facets,
         supported_languages=supported_langs,

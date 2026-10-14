@@ -132,6 +132,18 @@ class _PromptedNodeDataMixin(BaseModel):
             "node's prompt at runtime."
         ),
     )
+    calendar_booking_enabled: bool = spec_field(
+        default=False,
+        ui_type=PropertyType.boolean,
+        display_name="Calendar Booking Enabled",
+        description="When true, enables calendar appointment booking tools for this node.",
+    )
+    calendar_url: Optional[str] = spec_field(
+        default=None,
+        ui_type=PropertyType.string,
+        display_name="Calendar URL",
+        description="Optional external booking link (e.g., Cal.com or Calendly).",
+    )
 
 
 class _ExtractionNodeDataMixin(BaseModel):

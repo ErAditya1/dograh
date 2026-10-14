@@ -87,6 +87,8 @@ class InitiateCallRequest(BaseModel):
     call_forwarding_enabled: bool | None = None
     forwarding_phone_number: str | None = None
     forwarding_condition: str | None = None
+    calendar_booking_enabled: bool | None = None
+    calendar_url: str | None = None
 
 
 async def _get_execution_user_id(workflow, fallback_user_id: int | None = None) -> int:
@@ -385,6 +387,10 @@ async def initiate_call(
                 init_ctx["transfer_destination"] = request.forwarding_phone_number
             if request.forwarding_condition:
                 init_ctx["forwarding_condition"] = request.forwarding_condition
+            if request.calendar_booking_enabled is not None:
+                init_ctx["calendar_booking_enabled"] = request.calendar_booking_enabled
+            if request.calendar_url:
+                init_ctx["calendar_url"] = request.calendar_url
             run_inputs = await prepare_workflow_run_inputs(
                 db_client,
                 workflow,

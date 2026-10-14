@@ -96,6 +96,7 @@ async def compose_functions_for_node(
     *,
     node: "Node",
     custom_tool_manager: Optional["CustomToolManager"],
+    context_variables: Optional[dict] = None,
 ) -> list[dict]:
     """Compose the function/tool schemas for a workflow node.
 
@@ -106,11 +107,13 @@ async def compose_functions_for_node(
     Args:
         node: The workflow node to compose functions for.
         custom_tool_manager: Manager for custom and built-in tools (may be None).
+        context_variables: Runtime context variables (including campaign settings).
 
     Returns:
         A list of function schemas to register with the LLM.
     """
     functions: list[dict] = []
+    ctx = context_variables or {}
 
     # Knowledge base retrieval tool
     if node.document_uuids:
@@ -137,5 +140,49 @@ async def compose_functions_for_node(
             outgoing_edge.get_function_name(), outgoing_edge.condition
         )
         functions.append(function_schema)
+
+    # Calendar booking tools (when enabled on node, in campaign context, or present in system prompt)
+    node_prompt = getattr(node, "prompt", "") or ""
+    if (
+        getattr(node, "calendar_booking_enabled", False)
+        or bool(ctx.get("calendar_booking_enabled", False))
+        or "APPOINTMENT / CALENDAR SCHEDULING" in node_prompt
+        or "book_appointment" in node_prompt
+    ):
+        from api.services.workflow.tools.calendar import get_calendar_tools
+        for tool_def in get_calendar_tools():
+            func = tool_def["function"]
+            functions.append(
+                get_function_schema(
+                    func["name"],
+                    func["description"],
+                    properties=func["parameters"]["properties"],
+                    required=func["parameters"]["required"],
+                )
+            )
+
+    # Call forwarding tool (when enabled on node, in campaign context, or forwarding phone number is in prompt)
+    if (
+        getattr(node, "call_forwarding_enabled", False)
+        or getattr(node, "forwarding_phone_number", None)
+        or bool(ctx.get("call_forwarding_enabled", False))
+        or bool(ctx.get("forwarding_phone_number"))
+        or bool(ctx.get("transfer_destination"))
+        or "CALL FORWARDING" in node_prompt
+        or "forward the call to" in node_prompt
+    ):
+        functions.append(
+            get_function_schema(
+                "transfer_call",
+                "Transfer or forward the live call to a human agent, manager, or specialist. Call this tool immediately when the customer requests to speak with a human or when transfer conditions are met.",
+                properties={
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional reason for transferring the call.",
+                    }
+                },
+                required=[],
+            )
+        )
 
     return functions

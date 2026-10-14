@@ -142,6 +142,26 @@ class Node:
         self.pre_call_fetch_credential_uuid = getattr(
             data, "pre_call_fetch_credential_uuid", None
         )
+        self.calendar_booking_enabled = getattr(
+            data, "calendar_booking_enabled", False
+        ) or (
+            isinstance(data, dict) and data.get("calendar_booking_enabled", False)
+        )
+        self.calendar_url = getattr(
+            data, "calendar_url", None
+        ) or (
+            data.get("calendar_url") if isinstance(data, dict) else None
+        )
+        self.call_forwarding_enabled = getattr(
+            data, "call_forwarding_enabled", False
+        ) or (
+            isinstance(data, dict) and data.get("call_forwarding_enabled", False)
+        )
+        self.forwarding_phone_number = getattr(
+            data, "forwarding_phone_number", None
+        ) or (
+            data.get("forwarding_phone_number") if isinstance(data, dict) else None
+        )
 
         self.data = data
 

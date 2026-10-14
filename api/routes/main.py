@@ -89,6 +89,67 @@ for _integration_router in all_routers():
     router.include_router(_integration_router)
 
 
+@router.get("/platform/defaults")
+async def get_platform_defaults_endpoint():
+    """Return platform default configurations including default providers, models, and voices."""
+    from api.services.platform_keys import _MASTER_KEYS_CACHE, refresh_master_keys_cache
+    if not _MASTER_KEYS_CACHE.get("tts"):
+        try:
+            await refresh_master_keys_cache()
+        except Exception:
+            pass
+
+    def_tts_prov = None
+    def_tts_model = None
+    def_tts_voice = None
+    for p, d in _MASTER_KEYS_CACHE.get("tts", {}).items():
+        if d.get("is_default"):
+            def_tts_prov = p
+            def_tts_model = d.get("default_model")
+            def_tts_voice = d.get("default_voice")
+            break
+    if not def_tts_prov and _MASTER_KEYS_CACHE.get("tts"):
+        first_p = next(iter(_MASTER_KEYS_CACHE["tts"]))
+        def_tts_prov = first_p
+        def_tts_model = _MASTER_KEYS_CACHE["tts"][first_p].get("default_model")
+        def_tts_voice = _MASTER_KEYS_CACHE["tts"][first_p].get("default_voice")
+
+    def_llm_prov = None
+    def_llm_model = None
+    for p, d in _MASTER_KEYS_CACHE.get("llm", {}).items():
+        if d.get("is_default"):
+            def_llm_prov = p
+            def_llm_model = d.get("default_model")
+            break
+    if not def_llm_prov and _MASTER_KEYS_CACHE.get("llm"):
+        first_p = next(iter(_MASTER_KEYS_CACHE["llm"]))
+        def_llm_prov = first_p
+        def_llm_model = _MASTER_KEYS_CACHE["llm"][first_p].get("default_model")
+
+    def_stt_prov = None
+    def_stt_model = None
+    for p, d in _MASTER_KEYS_CACHE.get("stt", {}).items():
+        if d.get("is_default"):
+            def_stt_prov = p
+            def_stt_model = d.get("default_model")
+            break
+    if not def_stt_prov and _MASTER_KEYS_CACHE.get("stt"):
+        first_p = next(iter(_MASTER_KEYS_CACHE["stt"]))
+        def_stt_prov = first_p
+        def_stt_model = _MASTER_KEYS_CACHE["stt"][first_p].get("default_model")
+
+    return {
+        "default_tts_provider": def_tts_prov or "cartesia",
+        "default_llm_provider": def_llm_prov or "openai",
+        "default_stt_provider": def_stt_prov or "deepgram",
+        "default_model": def_llm_model or "gpt-4o-mini",
+        "default_tts_model": def_tts_model,
+        "default_stt_model": def_stt_model,
+        "default_voice": def_tts_voice or "default",
+        "default_language": "en",
+    }
+
+
 @router.get("/organization_usage")
 @router.get("/organization_usage/")
 async def get_legacy_organization_usage(

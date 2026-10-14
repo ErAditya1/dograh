@@ -112,6 +112,58 @@ def get_default_platform_provider_and_model(
     return None
 
 
+def get_default_platform_provider_and_settings(
+    service_type: str,
+) -> Optional[Tuple[str, str, Optional[str], Optional[str]]]:
+    """Return (provider, api_key, default_model, default_voice) for the marked default master provider."""
+    st = service_type.lower()
+    providers_map = _MASTER_KEYS_CACHE.get(st, {})
+    for prov, data in providers_map.items():
+        if data.get("is_default") and data.get("api_key"):
+            return (
+                prov,
+                data["api_key"],
+                data.get("default_model"),
+                data.get("default_voice"),
+            )
+    if providers_map:
+        first_prov = next(iter(providers_map))
+        return (
+            first_prov,
+            providers_map[first_prov]["api_key"],
+            providers_map[first_prov].get("default_model"),
+            providers_map[first_prov].get("default_voice"),
+        )
+    return None
+
+
+def get_all_platform_defaults() -> dict:
+    """Return dictionary of current default provider, model, voice across services."""
+    res = {}
+    for st in ("tts", "llm", "stt"):
+        providers_map = _MASTER_KEYS_CACHE.get(st, {})
+        def_prov = None
+        def_model = None
+        def_voice = None
+        for prov, data in providers_map.items():
+            if data.get("is_default") and data.get("api_key"):
+                def_prov = prov
+                def_model = data.get("default_model")
+                def_voice = data.get("default_voice")
+                break
+        if not def_prov and providers_map:
+            first_prov = next(iter(providers_map))
+            def_prov = first_prov
+            def_model = providers_map[first_prov].get("default_model")
+            def_voice = providers_map[first_prov].get("default_voice")
+        res[st] = {
+            "provider": def_prov,
+            "default_model": def_model,
+            "default_voice": def_voice,
+        }
+    return res
+
+
 def get_model_rate_per_minute(service_type: str, provider: str, model: str) -> float:
     """Get the configured rate per minute for a model, or return a sensible default."""
     defaults = {

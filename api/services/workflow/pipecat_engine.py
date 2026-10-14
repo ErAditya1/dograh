@@ -605,6 +605,138 @@ class PipecatEngine:
             "retrieve_from_knowledge_base", agent.bind_tool(self, retrieve_kb_func)
         )
 
+    async def _register_calendar_functions(
+        self, *, agent: AgentRuntime | None = None
+    ) -> None:
+        """Register built-in calendar booking tools (book_appointment, check_available_slots) with the LLM."""
+        agent = agent or self.active_agent
+        organization_id = await self._get_organization_id()
+        if not organization_id:
+            logger.warning("No organization_id available for calendar booking function")
+            return
+
+        logger.info(f"Registering calendar tools for agent in organization {organization_id}")
+
+        from api.services.workflow.tools.calendar import (
+            execute_book_appointment,
+            execute_check_available_slots,
+        )
+
+        async def book_appointment_func(params: FunctionCallParams) -> None:
+            logger.info(f"LLM Function Call EXECUTED: book_appointment with arguments: {params.arguments}")
+            try:
+                res = await execute_book_appointment(
+                    organization_id=organization_id,
+                    args=params.arguments,
+                    context_vars=self._call_context_vars,
+                )
+                logger.info(f"book_appointment result: {res}")
+                await params.result_callback(res)
+            except Exception as e:
+                logger.error(f"book_appointment failed: {e}")
+                await params.result_callback(
+                    {"success": False, "error": str(e), "message": "Failed to schedule appointment."}
+                )
+
+        async def check_available_slots_func(params: FunctionCallParams) -> None:
+            logger.info(f"LLM Function Call EXECUTED: check_available_slots with arguments: {params.arguments}")
+            try:
+                date_str = params.arguments.get("date", "")
+                res = await execute_check_available_slots(
+                    organization_id=organization_id,
+                    date_str=date_str,
+                )
+                await params.result_callback(res)
+            except Exception as e:
+                logger.error(f"check_available_slots failed: {e}")
+                await params.result_callback(
+                    {"success": False, "error": str(e), "available_slots": []}
+                )
+
+        agent.llm.register_function(
+            "book_appointment", agent.bind_tool(self, book_appointment_func)
+        )
+        agent.llm.register_function(
+            "check_available_slots", agent.bind_tool(self, check_available_slots_func)
+        )
+
+    async def _register_call_forwarding_function(
+        self, destination_number: str | None, *, agent: AgentRuntime | None = None
+    ) -> None:
+        """Register the transfer_call tool with the LLM for live forwarding."""
+        agent = agent or self.active_agent
+        dest = (destination_number or "").strip()
+        logger.info(f"Registering transfer_call function for agent (destination: '{dest}')")
+
+        async def transfer_call_func(params: FunctionCallParams) -> None:
+            logger.info(f"LLM Function Call EXECUTED: transfer_call with arguments: {params.arguments}")
+            reason = params.arguments.get("reason", "Customer requested transfer")
+            target = dest or params.arguments.get("destination") or ""
+            if not target:
+                await params.result_callback({
+                    "status": "failed",
+                    "message": "Transfer number is not configured.",
+                })
+                return
+
+            workflow_run = (
+                await db_client.get_workflow_run_by_id(self._workflow_run_id)
+                if self._workflow_run_id
+                else None
+            )
+            is_test_mode = workflow_run and workflow_run.mode in [
+                WorkflowRunMode.TEXTCHAT.value,
+                WorkflowRunMode.WEBRTC.value,
+                WorkflowRunMode.SMALLWEBRTC.value,
+            ]
+            if is_test_mode:
+                logger.info(f"Simulating call transfer to {target} in test mode ({workflow_run.mode})")
+                await params.result_callback({
+                    "status": "transferring",
+                    "action": "transfer_call",
+                    "destination": target,
+                    "reason": reason,
+                    "message": f"Transfer initiated to {target}. In live PSTN calls, the carrier will forward the call now.",
+                })
+                return
+
+            organization_id = await self._get_organization_id()
+            if not organization_id or not workflow_run:
+                await params.result_callback({
+                    "status": "failed",
+                    "message": "Missing organization or workflow run context for telephony transfer.",
+                })
+                return
+
+            try:
+                from api.services.telephony.factory import get_telephony_provider_for_run
+                provider = await get_telephony_provider_for_run(workflow_run, organization_id)
+                if provider and hasattr(provider, "transfer_call"):
+                    await provider.transfer_call(
+                        workflow_run=workflow_run,
+                        destination=target,
+                    )
+                    await params.result_callback({
+                        "status": "success",
+                        "action": "transferred",
+                        "destination": target,
+                    })
+                else:
+                    logger.warning("Telephony provider does not support direct transfer_call, ending leg with transfer disposition")
+                    self.set_call_disposition(f"transferred_to_{target}")
+                    await params.result_callback({
+                        "status": "success",
+                        "action": "transferred",
+                        "destination": target,
+                    })
+            except Exception as e:
+                logger.error(f"Carrier transfer_call failed: {e}")
+                await params.result_callback({"status": "failed", "error": str(e)})
+
+        agent.llm.register_function(
+            "transfer_call", agent.bind_tool(self, transfer_call_func)
+        )
+
     async def _perform_variable_extraction_if_needed(
         self,
         node: Optional[Node],
@@ -835,6 +967,39 @@ class PipecatEngine:
             await self._register_knowledge_base_function(
                 node.document_uuids, agent=agent
             )
+        node_prompt = getattr(node, "prompt", "") or ""
+        ctx = self._call_context_vars or {}
+
+        # 1. Calendar booking functions (active from node config, prompt directives, or campaign context)
+        calendar_enabled = (
+            getattr(node, "calendar_booking_enabled", False)
+            or bool(ctx.get("calendar_booking_enabled", False))
+            or "APPOINTMENT / CALENDAR SCHEDULING" in node_prompt
+            or "book_appointment" in node_prompt
+        )
+        if calendar_enabled:
+            await self._register_calendar_functions(agent=agent)
+
+        # 2. Call forwarding functions (active from node config, campaign context, or prompt directives)
+        forwarding_num = (
+            getattr(node, "forwarding_phone_number", None)
+            or ctx.get("forwarding_phone_number")
+            or ctx.get("transfer_destination")
+        )
+        if not forwarding_num and "forward the call to" in node_prompt:
+            import re
+            m = re.search(r"forward the call to\s+([\+\d\s\-\(\)]+)", node_prompt)
+            if m:
+                forwarding_num = m.group(1).strip().rstrip(".").strip()
+
+        forwarding_enabled = (
+            getattr(node, "call_forwarding_enabled", False)
+            or bool(ctx.get("call_forwarding_enabled", False))
+            or bool(forwarding_num)
+        )
+        if forwarding_enabled:
+            await self._register_call_forwarding_function(forwarding_num, agent=agent)
+
         prompt = compose_system_prompt_for_node(
             node=node,
             workflow=agent.workflow,
@@ -842,15 +1007,22 @@ class PipecatEngine:
             has_recordings=self._has_recordings,
         )
         functions = await compose_functions_for_node(
-            node=node, custom_tool_manager=manager
+            node=node, custom_tool_manager=manager, context_variables=ctx
         )
         agent.tools = ToolsSchema(standard_tools=functions)
-        agent.system_prompt = prompt.text
+
+        prompt_text = prompt.text
+        # Inject campaign-specific instructions if running an outbound campaign call
+        campaign_instr = ctx.get("campaign_instructions")
+        if campaign_instr and campaign_instr not in prompt_text:
+            prompt_text = f"{prompt_text}\n\n### Campaign Specific Instructions:\n{campaign_instr}"
+
+        agent.system_prompt = prompt_text
         if agent.recording_router is not None:
             agent.recording_router.set_enabled(prompt.recording_enabled)
         if apply_settings:
             await agent.llm._update_settings(
-                LLMSettings(system_instruction=prompt.text)
+                LLMSettings(system_instruction=prompt_text)
             )
 
     async def _setup_llm_context(self, node: Node) -> None:
