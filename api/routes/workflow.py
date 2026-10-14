@@ -7,7 +7,8 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from httpx import HTTPStatusError
-from sqlalchemy import and_, select, text
+from sqlalchemy import and_, func, select, text
+from sqlalchemy.orm import selectinload
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
@@ -2541,11 +2542,15 @@ async def update_custom_agent(
         raise HTTPException(status_code=400, detail="User must have an active organization selected")
 
     async with db_client.async_session() as session:
-        stmt = select(WorkflowModel).where(
-            and_(
-                WorkflowModel.id == workflow_id,
-                WorkflowModel.organization_id == org_id,
-                WorkflowModel.is_builtin == False,
+        stmt = (
+            select(WorkflowModel)
+            .options(selectinload(WorkflowModel.released_definition))
+            .where(
+                and_(
+                    WorkflowModel.id == workflow_id,
+                    WorkflowModel.organization_id == org_id,
+                    WorkflowModel.is_builtin == False,
+                )
             )
         )
         res = await session.execute(stmt)
@@ -2621,12 +2626,20 @@ async def update_custom_agent(
         workflow.builtin_conversion_goal = request.conversion_goal or {}
         workflow.workflow_definition = definition
 
+        # Safely compute next version number without triggering lazy-load MissingGreenlet
+        latest_ver_stmt = select(func.coalesce(func.max(WorkflowDefinitionModel.version_number), 0)).where(
+            WorkflowDefinitionModel.workflow_id == workflow.id
+        )
+        ver_res = await session.execute(latest_ver_stmt)
+        latest_version = ver_res.scalar() or 0
+        next_version = latest_version + 1
+
         wf_def_row = WorkflowDefinitionModel(
             workflow_id=workflow.id,
             workflow_json=definition,
             is_current=True,
             status="published",
-            version_number=(workflow.released_definition.version_number + 1) if workflow.released_definition else 1,
+            version_number=next_version,
             published_at=datetime.now(),
             workflow_configurations={},
             template_context_variables={},
