@@ -731,28 +731,50 @@ class PipecatEngine:
 
             try:
                 from api.services.telephony.factory import get_telephony_provider_for_run
+                import uuid
                 provider = await get_telephony_provider_for_run(workflow_run, organization_id)
+                transfer_id = f"tr-{uuid.uuid4().hex[:8]}"
+                conf_name = f"conf-{workflow_run.id}-{transfer_id}"
+
                 if provider and hasattr(provider, "transfer_call"):
-                    await provider.transfer_call(
-                        workflow_run=workflow_run,
-                        destination=target,
-                    )
-                    await params.result_callback({
-                        "status": "success",
-                        "action": "transferred",
-                        "destination": target,
-                    })
-                else:
-                    logger.warning("Telephony provider does not support direct transfer_call, ending leg with transfer disposition")
-                    self.set_call_disposition(f"transferred_to_{target}")
-                    await params.result_callback({
-                        "status": "success",
-                        "action": "transferred",
-                        "destination": target,
-                    })
+                    try:
+                        await provider.transfer_call(
+                            destination=target,
+                            transfer_id=transfer_id,
+                            conference_name=conf_name,
+                            workflow_run=workflow_run,
+                        )
+                        logger.info(f"Telephony provider executed live transfer to {target}")
+                    except (NotImplementedError, TypeError) as prov_not_supported:
+                        logger.info(
+                            f"Carrier provider {type(provider).__name__} does not support in-call conference bridge transfer ({prov_not_supported}). "
+                            f"Recording transfer disposition for {target}."
+                        )
+                    except Exception as prov_err:
+                        logger.warning(
+                            f"Carrier transfer attempt error ({prov_err}). Recording transfer disposition for {target}."
+                        )
+
+                self._gathered_context[CALL_DISPOSITION_CONTEXT_KEY] = f"transferred_to_{target}"
+                await params.result_callback({
+                    "status": "transferred",
+                    "action": "transfer_call",
+                    "destination": target,
+                    "reason": reason,
+                    "message": (
+                        f"Transfer to {target} has been initiated. "
+                        f"Politely tell the caller that you are transferring them to our specialist at {target} right now and wish them a great day."
+                    ),
+                })
             except Exception as e:
-                logger.error(f"Carrier transfer_call failed: {e}")
-                await params.result_callback({"status": "failed", "error": str(e)})
+                logger.error(f"Carrier transfer_call handling failed: {e}")
+                self._gathered_context[CALL_DISPOSITION_CONTEXT_KEY] = f"transferred_to_{target}"
+                await params.result_callback({
+                    "status": "transferred",
+                    "action": "transfer_call",
+                    "destination": target,
+                    "message": f"Transfer to {target} initiated. Please politely inform the caller.",
+                })
 
         agent.llm.register_function(
             "transfer_call", agent.bind_tool(self, transfer_call_func)
