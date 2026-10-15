@@ -6,7 +6,7 @@ from pipecat.utils.enums import RealtimeFeedbackType
 def _format_timestamp_range(
     payload: dict, event: dict, include_end_timestamps: bool
 ) -> str:
-    start_timestamp = payload.get("timestamp") or event.get("timestamp", "")
+    start_timestamp = event.get("timestamp") or payload.get("timestamp", "")
     if not include_end_timestamps:
         return start_timestamp
 

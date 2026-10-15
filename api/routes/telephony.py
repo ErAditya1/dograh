@@ -391,6 +391,24 @@ async def initiate_call(
                 init_ctx["calendar_booking_enabled"] = request.calendar_booking_enabled
             if request.calendar_url:
                 init_ctx["calendar_url"] = request.calendar_url
+
+            # Fallback to inheriting forwarding & calendar settings from workflow definition nodes
+            if request.call_forwarding_enabled is None or request.calendar_booking_enabled is None:
+                wf_def = getattr(workflow, "workflow_definition", None) or {}
+                nodes = wf_def.get("nodes", []) if isinstance(wf_def, dict) else []
+                for n in nodes:
+                    ndata = n.get("data", {}) if isinstance(n, dict) else {}
+                    if request.call_forwarding_enabled is None and ndata.get("call_forwarding_enabled"):
+                        init_ctx["call_forwarding_enabled"] = True
+                        if ndata.get("forwarding_phone_number") and "forwarding_phone_number" not in init_ctx:
+                            init_ctx["forwarding_phone_number"] = ndata["forwarding_phone_number"]
+                            init_ctx["transfer_destination"] = ndata["forwarding_phone_number"]
+                        if ndata.get("forwarding_condition") and "forwarding_condition" not in init_ctx:
+                            init_ctx["forwarding_condition"] = ndata["forwarding_condition"]
+                    if request.calendar_booking_enabled is None and ndata.get("calendar_booking_enabled"):
+                        init_ctx["calendar_booking_enabled"] = True
+                        if ndata.get("calendar_url") and "calendar_url" not in init_ctx:
+                            init_ctx["calendar_url"] = ndata["calendar_url"]
             run_inputs = await prepare_workflow_run_inputs(
                 db_client,
                 workflow,

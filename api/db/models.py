@@ -665,6 +665,7 @@ class WorkflowModel(Base):
             WorkflowDefinitionModel.workflow_id == WorkflowModel.id,
             WorkflowDefinitionModel.is_current.is_(True),
         ),
+        order_by="desc(WorkflowDefinitionModel.id)",
         uselist=False,
         viewonly=True,
     )

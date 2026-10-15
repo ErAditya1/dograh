@@ -129,7 +129,6 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
                 stmt_num = select(TelephonyPhoneNumberModel).where(
                     TelephonyPhoneNumberModel.organization_id == organization_id,
                     TelephonyPhoneNumberModel.address_normalized == num.address_normalized,
-                    TelephonyPhoneNumberModel.is_platform_inventory == False,
                 )
                 org_num = (await session.execute(stmt_num)).scalar_one_or_none()
 
@@ -158,10 +157,12 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
                         org_num.telephony_configuration_id != org_cfg.id
                         or not org_num.is_active
                         or org_num.pool_type != (num.pool_type or "shared_trial")
+                        or org_num.is_platform_inventory
                     ):
                         org_num.telephony_configuration_id = org_cfg.id
                         org_num.is_active = True
                         org_num.pool_type = num.pool_type or "shared_trial"
+                        org_num.is_platform_inventory = False
                         changed = True
                     if num.extra_metadata and org_num.extra_metadata != num.extra_metadata:
                         org_num.extra_metadata = dict(num.extra_metadata or {})

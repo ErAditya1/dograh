@@ -7,7 +7,12 @@ from sqlalchemy.future import select
 from sqlalchemy.orm import load_only, selectinload
 
 from api.db.base_client import BaseDBClient
-from api.db.models import WorkflowDefinitionModel, WorkflowModel, WorkflowRunModel
+from api.db.models import (
+    UserModel,
+    WorkflowDefinitionModel,
+    WorkflowModel,
+    WorkflowRunModel,
+)
 
 
 class WorkflowClient(BaseDBClient):
@@ -209,12 +214,23 @@ class WorkflowClient(BaseDBClient):
             if not draft:
                 raise ValueError(f"No draft exists for workflow {workflow_id}")
 
+            # Unset is_current on all other definitions for this workflow
+            await session.execute(
+                update(WorkflowDefinitionModel)
+                .where(
+                    WorkflowDefinitionModel.workflow_id == workflow_id,
+                    WorkflowDefinitionModel.id != draft.id,
+                )
+                .values(is_current=False)
+            )
+
             # Archive the current published version
             await session.execute(
                 update(WorkflowDefinitionModel)
                 .where(
                     WorkflowDefinitionModel.workflow_id == workflow_id,
                     WorkflowDefinitionModel.status == "published",
+                    WorkflowDefinitionModel.id != draft.id,
                 )
                 .values(status="archived", is_current=False)
             )
@@ -497,7 +513,11 @@ class WorkflowClient(BaseDBClient):
                 raise
 
     async def get_all_workflows_for_listing(
-        self, organization_id: int = None, status: str = None
+        self,
+        organization_id: int = None,
+        status: str = None,
+        admin_only: bool = False,
+        current_user_id: int = None,
     ) -> list[WorkflowModel]:
         """Get workflows with only the columns needed for listing.
 
@@ -507,6 +527,8 @@ class WorkflowClient(BaseDBClient):
         Args:
             organization_id: Filter by organization ID
             status: Filter by status (active/archived)
+            admin_only: If True, only include workflows created by admins
+            current_user_id: Current user's ID for ownership checks
 
         Returns:
             List of WorkflowModel with only id, name, status, created_at loaded
@@ -523,6 +545,7 @@ class WorkflowClient(BaseDBClient):
                     WorkflowModel.created_at,
                     WorkflowModel.folder_id,
                     WorkflowModel.workflow_uuid,
+                    WorkflowModel.user_id,
                 )
             ).where(
                 WorkflowModel.organization_id == organization_id,
@@ -531,6 +554,16 @@ class WorkflowClient(BaseDBClient):
 
             if status:
                 query = query.where(WorkflowModel.status == status)
+
+            if admin_only:
+                query = query.outerjoin(UserModel, WorkflowModel.user_id == UserModel.id)
+                admin_conditions = [
+                    UserModel.is_superuser.is_(True),
+                    WorkflowModel.user_id.is_(None),
+                ]
+                if current_user_id:
+                    admin_conditions.append(WorkflowModel.user_id == current_user_id)
+                query = query.where(or_(*admin_conditions))
 
             result = await session.execute(query)
             return result.scalars().all()

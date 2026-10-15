@@ -313,6 +313,8 @@ class WorkflowListResponse(BaseModel):
     total_runs: int
     folder_id: int | None = None
     workflow_uuid: str | None = None
+    user_id: int | None = None
+    is_admin_created: bool | None = None
 
 
 class MoveWorkflowToFolderRequest(BaseModel):
@@ -762,6 +764,10 @@ async def get_workflows(
         None,
         description="Filter by status - can be single value (active/archived) or comma-separated (active,archived)",
     ),
+    admin_only: Optional[bool] = Query(
+        False,
+        description="Filter to only return workflows created by platform or organization admins",
+    ),
 ) -> List[WorkflowListResponse]:
     """Get all workflows for the authenticated user's organization.
 
@@ -780,13 +786,18 @@ async def get_workflows(
                 await db_client.get_all_workflows_for_listing(
                     organization_id=user.selected_organization_id,
                     status=status_value,
+                    admin_only=bool(admin_only),
+                    current_user_id=user.id,
                 )
             )
         workflows = all_workflows
     else:
         # No status filter
         workflows = await db_client.get_all_workflows_for_listing(
-            organization_id=user.selected_organization_id, status=None
+            organization_id=user.selected_organization_id,
+            status=None,
+            admin_only=bool(admin_only),
+            current_user_id=user.id,
         )
 
     # Get run counts for all workflows in a single query
@@ -802,6 +813,12 @@ async def get_workflows(
             total_runs=run_counts.get(workflow.id, 0),
             folder_id=workflow.folder_id,
             workflow_uuid=workflow.workflow_uuid,
+            user_id=workflow.user_id,
+            is_admin_created=(
+                workflow.user_id is None
+                or workflow.user_id == user.id
+                or getattr(getattr(workflow, "user", None), "is_superuser", False)
+            ),
         )
         for workflow in workflows
     ]
@@ -2169,12 +2186,25 @@ async def publish_builtin_agent(
             def_res = await session.execute(def_stmt)
             existing_def = def_res.scalars().first()
             if existing_def:
+                await session.execute(
+                    update(WorkflowDefinitionModel)
+                    .where(
+                        WorkflowDefinitionModel.workflow_id == workflow.id,
+                        WorkflowDefinitionModel.id != existing_def.id,
+                    )
+                    .values(is_current=False)
+                )
                 workflow.released_definition_id = existing_def.id
                 existing_def.is_current = True
                 existing_def.status = "published"
                 if not existing_def.published_at:
                     existing_def.published_at = datetime.now()
             else:
+                await session.execute(
+                    update(WorkflowDefinitionModel)
+                    .where(WorkflowDefinitionModel.workflow_id == workflow.id)
+                    .values(is_current=False)
+                )
                 wf_def_row = WorkflowDefinitionModel(
                     workflow_id=workflow.id,
                     workflow_json=workflow.workflow_definition or {},
@@ -2633,6 +2663,13 @@ async def update_custom_agent(
         ver_res = await session.execute(latest_ver_stmt)
         latest_version = ver_res.scalar() or 0
         next_version = latest_version + 1
+
+        # Mark all previous definitions for this workflow as not current
+        await session.execute(
+            update(WorkflowDefinitionModel)
+            .where(WorkflowDefinitionModel.workflow_id == workflow.id)
+            .values(is_current=False)
+        )
 
         wf_def_row = WorkflowDefinitionModel(
             workflow_id=workflow.id,
