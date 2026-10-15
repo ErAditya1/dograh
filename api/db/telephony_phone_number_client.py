@@ -647,6 +647,10 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                 .where(
                     TelephonyPhoneNumberModel.organization_id == organization_id,
                     TelephonyPhoneNumberModel.is_active == True,
+                    or_(
+                        TelephonyPhoneNumberModel.rental_status.is_(None),
+                        TelephonyPhoneNumberModel.rental_status != "released",
+                    ),
                     TelephonyConfigurationModel.name.like("Platform - %"),
                 )
                 .order_by(TelephonyPhoneNumberModel.created_at.desc())

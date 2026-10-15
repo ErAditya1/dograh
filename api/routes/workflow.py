@@ -7,7 +7,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from httpx import HTTPStatusError
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import and_, delete, func, select, text, update
 from sqlalchemy.orm import selectinload
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field, ValidationError
 from api.constants import DEPLOYMENT_MODE
 from api.db import db_client
 from api.db.agent_trigger_client import TriggerPathConflictError
-from api.db.models import UserModel, WorkflowDefinitionModel, WorkflowModel
+from api.db.models import UserModel, WorkflowDefinitionModel, WorkflowModel, WorkflowRunModel
 from api.db.workflow_template_client import WorkflowTemplateClient
 from api.enums import (
     CallType,
@@ -2331,14 +2331,32 @@ async def delete_builtin_agent(
     workflow_id: int,
     user: UserModel = Depends(get_superuser),
 ):
-    """Permanently delete a built-in agent from the platform catalog (Superuser only)."""
+    """Permanently delete or archive a built-in agent from the platform catalog (Superuser only)."""
     async with db_client.async_session() as session:
         wf = await session.get(WorkflowModel, workflow_id)
         if not wf:
             raise HTTPException(status_code=404, detail="Agent not found")
-        await session.delete(wf)
-        await session.commit()
-        return {"status": "success", "message": f"Agent #{workflow_id} deleted"}
+
+        # Check if there are associated call runs to prevent NOT NULL foreign key constraint errors
+        runs_res = await session.execute(
+            select(WorkflowRunModel.id).where(WorkflowRunModel.workflow_id == workflow_id).limit(1)
+        )
+        has_runs = runs_res.scalar_one_or_none() is not None
+
+        if has_runs:
+            # Soft delete from catalog so historical call logs are preserved
+            wf.is_builtin = False
+            wf.status = WorkflowStatus.DELETED.value
+            await session.commit()
+            return {"status": "success", "message": f"Agent #{workflow_id} unpublished and archived"}
+        else:
+            # Safe to hard delete definitions and workflow row
+            await session.execute(
+                delete(WorkflowDefinitionModel).where(WorkflowDefinitionModel.workflow_id == workflow_id)
+            )
+            await session.delete(wf)
+            await session.commit()
+            return {"status": "success", "message": f"Agent #{workflow_id} deleted"}
 
 
 @router.post("/builtin/{workflow_id}/import")
@@ -2373,6 +2391,12 @@ async def import_builtin_agent(
                 node.setdefault("data", {})["trigger_path"] = str(uuid.uuid4())
 
         new_name = request.name or f"{source_name} (My Copy)"
+        # Inherit configurations, but strip publisher's hardcoded model_overrides
+        # so the newly imported agent dynamically uses the importing user's own
+        # configured models, voices, or master platform default providers
+        imported_configs = copy.deepcopy(source.workflow_configurations or {})
+        imported_configs.pop("model_overrides", None)
+
         new_workflow = WorkflowModel(
             name=new_name,
             workflow_uuid=str(uuid.uuid4()),
@@ -2382,7 +2406,7 @@ async def import_builtin_agent(
             workflow_definition=cloned_definition,
             template_context_variables=copy.deepcopy(source.template_context_variables or {}),
             call_disposition_codes=copy.deepcopy(source.call_disposition_codes or {}),
-            workflow_configurations=copy.deepcopy(source.workflow_configurations or {}),
+            workflow_configurations=imported_configs,
             is_builtin=False,
         )
         session.add(new_workflow)
@@ -2392,7 +2416,7 @@ async def import_builtin_agent(
             workflow_id=new_workflow.id,
             workflow_json=cloned_definition,
             template_context_variables=copy.deepcopy(source.template_context_variables or {}),
-            workflow_configurations=copy.deepcopy(source.workflow_configurations or {}),
+            workflow_configurations=imported_configs,
             is_current=True,
             status="published",
             version_number=1,

@@ -328,7 +328,7 @@ class TelephonyBillingService:
                         master_num.assigned_organization_id = claimed_orgs[0] if claimed_orgs else None
                     if not claimed_orgs:
                         master_num.rental_status = "available"
-                elif master_num.pool_type != "shared_trial":
+                else:
                     if master_num.assigned_organization_id == organization_id:
                         master_num.assigned_organization_id = None
                         master_num.rental_status = "available"

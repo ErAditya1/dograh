@@ -24,6 +24,32 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
         return False
 
     async with db_client.async_session() as session:
+        # Clean up any phantom non-trial platform numbers that were mistakenly auto-synced
+        # into this tenant organization without an explicit claim.
+        platform_cfg_ids_stmt = select(TelephonyConfigurationModel.id).where(
+            TelephonyConfigurationModel.organization_id == organization_id,
+            TelephonyConfigurationModel.name.like("Platform - %"),
+        )
+        platform_cfg_ids = (await session.execute(platform_cfg_ids_stmt)).scalars().all()
+
+        if platform_cfg_ids:
+            stmt_cleanup = (
+                update(TelephonyPhoneNumberModel)
+                .where(
+                    TelephonyPhoneNumberModel.organization_id == organization_id,
+                    TelephonyPhoneNumberModel.telephony_configuration_id.in_(platform_cfg_ids),
+                    TelephonyPhoneNumberModel.pool_type != "shared_trial",
+                    TelephonyPhoneNumberModel.rental_status != "active",
+                    TelephonyPhoneNumberModel.is_active == True,
+                )
+                .values(
+                    is_active=False,
+                    rental_status="released",
+                    is_default_caller_id=False,
+                )
+            )
+            await session.execute(stmt_cleanup)
+
         # Find active shared trial platform numbers and their active parent configurations
         stmt = (
             select(TelephonyPhoneNumberModel, TelephonyConfigurationModel)
@@ -34,7 +60,7 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
             .where(
                 TelephonyPhoneNumberModel.is_platform_inventory == True,
                 TelephonyPhoneNumberModel.is_active == True,
-                TelephonyPhoneNumberModel.pool_type.in_(["shared_trial", "shared_multi_org"]),
+                TelephonyPhoneNumberModel.pool_type == "shared_trial",
                 TelephonyConfigurationModel.inactive == False,
             )
             .order_by(TelephonyPhoneNumberModel.created_at)
@@ -42,6 +68,8 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
         result = await session.execute(stmt)
         rows = result.all()
         if not rows:
+            if platform_cfg_ids:
+                await session.commit()
             return False
 
         # Group numbers by their source config
@@ -143,7 +171,7 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
                         label=num.label or f"Platform Test {num.address}",
                         is_active=True,
                         is_default_caller_id=not has_default_caller,
-                        pool_type=num.pool_type or "shared_trial",
+                        pool_type="shared_trial",
                         is_platform_inventory=False,
                         monthly_price_cents=0,
                         extra_metadata=dict(num.extra_metadata or {}),
@@ -153,15 +181,17 @@ async def sync_shared_trial_telephony_for_org(organization_id: int) -> bool:
                     if not has_default_caller:
                         has_default_caller = True
                 else:
+                    # If this number was explicitly released or deactivated by the tenant, do NOT reactivate it!
+                    if org_num.rental_status == "released" or not org_num.is_active:
+                        continue
+
                     if (
                         org_num.telephony_configuration_id != org_cfg.id
-                        or not org_num.is_active
-                        or org_num.pool_type != (num.pool_type or "shared_trial")
+                        or org_num.pool_type != "shared_trial"
                         or org_num.is_platform_inventory
                     ):
                         org_num.telephony_configuration_id = org_cfg.id
-                        org_num.is_active = True
-                        org_num.pool_type = num.pool_type or "shared_trial"
+                        org_num.pool_type = "shared_trial"
                         org_num.is_platform_inventory = False
                         changed = True
                     if num.extra_metadata and org_num.extra_metadata != num.extra_metadata:
