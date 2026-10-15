@@ -66,6 +66,7 @@ import type {
   TelephonyConfigurationDetail,
   TelephonyConfigurationListItem,
 } from "@/client/types.gen";
+import { PageLayout, PageSection } from "@/components/layout/PageLayout";
 import { ConfigFormDialog } from "@/components/telephony/ConfigFormDialog";
 import {
   AlertDialog,
@@ -982,48 +983,78 @@ export default function TelephonyConfigurationsPage() {
                           {item.outbound_blocked_reason}
                         </p>
                       )}
-
-                      <div className="pt-2 border-t flex items-center justify-between gap-2">
-                        <div className="flex items-center gap-1">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                            onClick={() => onEdit(item)}
-                            title="Edit Credentials"
+                      <div className="pt-2 border-t flex flex-col gap-2">
+                        <div className="flex items-center justify-between">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              copyTextToClipboard(String(item.id))
+                                .then(() => toast.success("Configuration ID copied"))
+                                .catch(() => toast.error("Failed to copy ID"));
+                            }}
+                            title="Click to copy"
+                            className="inline-flex items-center gap-1 self-start rounded font-mono text-[11px] text-muted-foreground hover:text-foreground"
                           >
-                            <HugeiconsIcon icon={PencilIcon} className="h-4 w-4" />
-                          </Button>
-
-                          {!item.is_default_outbound && (
+                            <span>ID: {item.id}</span>
+                            <Copy className="h-3 w-3 shrink-0" />
+                          </button>
+                        </div>
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-1">
+                            {item.inactive && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-8 text-xs"
+                                onClick={() => onReactivate(item)}
+                                title="Reconnect this configuration now"
+                              >
+                                <RotateCcw className="h-3.5 w-3.5 mr-1" />
+                                Reactivate
+                              </Button>
+                            )}
                             <Button
                               variant="ghost"
                               size="icon"
                               className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                              onClick={() => onSetDefault(item)}
-                              title="Set as Default Outbound"
+                              onClick={() => onEdit(item)}
+                              title="Edit Credentials"
                             >
-                              <HugeiconsIcon icon={StarIcon} className="h-4 w-4" />
+                              <HugeiconsIcon icon={PencilIcon} className="h-4 w-4" />
                             </Button>
-                          )}
 
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 text-red-600 hover:text-red-700 hover:bg-red-50"
-                            onClick={() => setDeleteTarget(item)}
-                            title="Delete"
-                          >
-                            <HugeiconsIcon icon={Delete02Icon} className="h-4 w-4" />
+                            {!item.is_default_outbound && (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                                onClick={() => onSetDefault(item)}
+                                title="Set as Default Outbound"
+                              >
+                                <HugeiconsIcon icon={StarIcon} className="h-4 w-4" />
+                              </Button>
+                            )}
+
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-red-600 hover:text-red-700 hover:bg-red-50"
+                              onClick={() => setDeleteTarget(item)}
+                              title="Delete"
+                            >
+                              <HugeiconsIcon icon={Delete02Icon} className="h-4 w-4" />
+                            </Button>
+                          </div>
+
+                          <Button variant="outline" size="sm" asChild className="h-8 text-xs">
+                            <Link href={`/telephony-configurations/${item.id}`}>
+                              Manage Carrier
+                              <HugeiconsIcon icon={ChevronRightIcon} className="h-3.5 w-3.5 ml-1" />
+                            </Link>
                           </Button>
                         </div>
-
-                        <Button variant="outline" size="sm" asChild className="h-8 text-xs">
-                          <Link href={`/telephony-configurations/${item.id}`}>
-                            Manage Carrier
-                            <HugeiconsIcon icon={ChevronRightIcon} className="h-3.5 w-3.5 ml-1" />
-                          </Link>
-                        </Button>
                       </div>
                     </CardContent>
                   </Card>
@@ -1160,67 +1191,6 @@ export default function TelephonyConfigurationsPage() {
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={onConfirmDelete}>Delete</AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      {/* Purchase / Claim Confirmation Dialog */}
-      <AlertDialog
-        open={!!purchasingNumber}
-        onOpenChange={(o) => !o && setPurchasingNumber(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle className="flex items-center gap-2">
-              <HugeiconsIcon icon={ShoppingCart01Icon} className="h-5 w-5 text-primary" />
-              Confirm Phone Number Claim
-            </AlertDialogTitle>
-            <AlertDialogDescription className="space-y-3 pt-2">
-              <div className="rounded-lg bg-muted/60 p-3 text-sm space-y-1.5 border">
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Phone Number:</span>
-                  <span className="font-mono font-bold text-foreground">{purchasingNumber?.phone_number}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Category:</span>
-                  <span className="font-semibold capitalize text-foreground">
-                    {purchasingNumber?.pool_type === "shared_trial"
-                      ? "Shared Trial (Sandbox)"
-                      : purchasingNumber?.pool_type === "shared_multi_org"
-                      ? "Multi-Org Shared"
-                      : "Dedicated Caller ID"}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-muted-foreground">Carrier:</span>
-                  <span className="font-medium text-foreground capitalize">{purchasingNumber?.carrier}</span>
-                </div>
-                <div className="flex justify-between pt-1 border-t">
-                  <span className="text-muted-foreground">Pricing:</span>
-                  <span className="font-bold text-emerald-600 dark:text-emerald-400">
-                    {purchasingNumber?.pool_type === "shared_trial"
-                      ? "Free Sandbox"
-                      : purchasingNumber?.monthly_price_cents > 0
-                      ? `$${(purchasingNumber.monthly_price_cents / 100).toFixed(2)} / month`
-                      : "Included in Plan"}
-                  </span>
-                </div>
-              </div>
-              <p className="text-xs text-muted-foreground">
-                This number will be provisioned directly into your workspace. It will be pre-configured for instant outbound calls and ready for inbound agent assignment.
-              </p>
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (purchasingNumber) handleClaimNumber(purchasingNumber);
-              }}
-              className="bg-primary text-primary-foreground hover:bg-primary/90"
-            >
-              Confirm &amp; Provision
-            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

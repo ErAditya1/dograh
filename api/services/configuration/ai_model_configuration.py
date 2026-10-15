@@ -1,40 +1,19 @@
+"""Read an organization's effective model configuration from the catalog."""
+
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Literal
 
-from loguru import logger
-from pydantic import ValidationError
+from fastapi import HTTPException
 
 from api.constants import MPS_API_URL
-from api.db import db_client
-from api.db.models import OrganizationConfigurationModel
-from api.enums import OrganizationConfigurationKey
-from api.schemas.ai_model_configuration import (
-    DOGRAH_DEFAULT_LANGUAGE,
-    DOGRAH_DEFAULT_VOICE,
-    DOGRAH_SPEED_MAX,
-    DOGRAH_SPEED_MIN,
-    BYOKAIModelConfiguration,
-    BYOKPipelineAIModelConfiguration,
-    BYOKRealtimeAIModelConfiguration,
-    DograhManagedAIModelConfiguration,
-    EffectiveAIModelConfiguration,
-    OrganizationAIModelConfigurationV2,
-    compile_ai_model_configuration_v2,
-)
-from api.services.configuration.masking import (
-    SERVICE_SECRET_FIELDS,
-    contains_masked_key,
-    mask_key,
-    resolve_masked_api_keys,
-)
+from api.schemas.ai_model_configuration import EffectiveAIModelConfiguration
 from api.services.configuration.registry import ServiceProviders
-from api.services.configuration.resolve import resolve_effective_config
 
-AIModelConfigurationSource = Literal["organization_v2", "legacy_user_v1", "empty"]
+AIModelConfigurationSource = Literal["organization_v3", "empty"]
+# Retired inline workflow key. Rows converted by the catalog backfill keep it
+# as audit data; no code reads it, and saves drop it.
 WORKFLOW_MODEL_CONFIGURATION_V2_OVERRIDE_KEY = "model_configuration_v2_override"
 
 
@@ -42,14 +21,6 @@ WORKFLOW_MODEL_CONFIGURATION_V2_OVERRIDE_KEY = "model_configuration_v2_override"
 class ResolvedAIModelConfiguration:
     effective: EffectiveAIModelConfiguration
     source: AIModelConfigurationSource
-    organization_configuration: OrganizationAIModelConfigurationV2 | None = None
-
-
-@dataclass
-class WorkflowAIModelConfigurationMigrationResult:
-    workflow_count: int = 0
-    definition_count: int = 0
-    workflow_ids: list[int] | None = None
 
 
 def populate_effective_config_from_platform_defaults(
@@ -146,6 +117,24 @@ async def get_resolved_ai_model_configuration(
     organization_id: int | None,
 ) -> ResolvedAIModelConfiguration:
     """Resolve the effective model configuration for an organization."""
+    if organization_id is not None:
+        try:
+            from api.services.configuration.model_connections import (
+                get_default_model_configuration,
+                resolve_model_configuration,
+            )
+
+            default = await get_default_model_configuration(organization_id)
+            if default is not None:
+                resolved = await resolve_model_configuration(
+                    organization_id, default_row=default
+                )
+                return ResolvedAIModelConfiguration(
+                    effective=resolved.effective, source="organization_v3"
+                )
+        except Exception as e:
+            logger.debug("Could not resolve v3 model configuration: {}", e)
+
     organization_configuration_row = (
         await _get_organization_ai_model_configuration_v2_row(organization_id)
     )
@@ -178,15 +167,23 @@ async def get_effective_ai_model_configuration_for_workflow(
     organization_id: int | None,
     workflow_configurations: dict | None,
 ) -> EffectiveAIModelConfiguration:
+    """The definition's catalog binding layered on the organization default."""
     workflow_configurations = workflow_configurations or {}
-    v2_override = workflow_configurations.get(
-        WORKFLOW_MODEL_CONFIGURATION_V2_OVERRIDE_KEY
-    )
-    if v2_override:
-        return compile_ai_model_configuration_v2(
-            OrganizationAIModelConfigurationV2.model_validate(v2_override)
+    if workflow_configurations.get("model_configuration_override") is not None:
+        from api.services.configuration.model_connections import (
+            resolve_model_configuration,
         )
 
+        if organization_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Organization is required for model configuration.",
+            )
+        resolved = await resolve_model_configuration(
+            organization_id,
+            workflow_override=workflow_configurations["model_configuration_override"],
+        )
+        return resolved.effective
     resolved_config = await get_resolved_ai_model_configuration(
         organization_id=organization_id,
     )
@@ -416,6 +413,7 @@ def convert_legacy_ai_model_configuration_to_v2(
     )
 
 
+
 def dograh_embeddings_base_url() -> str:
     # AsyncOpenAI appends "/embeddings"; MPS exposes that under /api/v1/llm.
     return f"{MPS_API_URL}/api/v1/llm"
@@ -429,138 +427,3 @@ def apply_managed_embeddings_base_url(
     if provider == ServiceProviders.DOGRAH.value or provider == ServiceProviders.DOGRAH:
         return dograh_embeddings_base_url()
     return base_url
-
-
-def _merge_byok_secret_fields(incoming_byok: dict | None, existing_byok: dict | None):
-    if not isinstance(incoming_byok, dict) or not isinstance(existing_byok, dict):
-        return
-    incoming_mode = incoming_byok.get("mode")
-    existing_mode = existing_byok.get("mode")
-    if incoming_mode != existing_mode:
-        return
-    section_names = (
-        ("llm", "tts", "stt", "embeddings")
-        if incoming_mode == "pipeline"
-        else ("realtime", "llm", "embeddings")
-    )
-    incoming_container = incoming_byok.get(incoming_mode)
-    existing_container = existing_byok.get(existing_mode)
-    if not isinstance(incoming_container, dict) or not isinstance(
-        existing_container, dict
-    ):
-        return
-    for section_name in section_names:
-        incoming_section = incoming_container.get(section_name)
-        existing_section = existing_container.get(section_name)
-        if isinstance(incoming_section, dict) and isinstance(existing_section, dict):
-            _merge_service_secret_fields(incoming_section, existing_section)
-
-
-def _merge_service_secret_fields(incoming: dict, existing: dict):
-    if (
-        incoming.get("provider") is not None
-        and existing.get("provider") is not None
-        and incoming.get("provider") != existing.get("provider")
-    ):
-        return
-    for secret_field in SERVICE_SECRET_FIELDS:
-        if secret_field not in existing:
-            continue
-        incoming_secret = incoming.get(secret_field)
-        existing_secret = existing[secret_field]
-        if incoming_secret is None:
-            incoming[secret_field] = existing_secret
-        elif contains_masked_key(incoming_secret):
-            incoming[secret_field] = resolve_masked_api_keys(
-                incoming_secret,
-                existing_secret,
-            )
-
-
-def _raise_if_masked_secret(value):
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if key in SERVICE_SECRET_FIELDS and contains_masked_key(nested):
-                raise ValueError(
-                    f"The {key} appears to be masked. Please provide the actual "
-                    "value, not the masked value."
-                )
-            _raise_if_masked_secret(nested)
-    elif isinstance(value, list):
-        for item in value:
-            _raise_if_masked_secret(item)
-
-
-def _mask_secret_fields(value):
-    if isinstance(value, dict):
-        for key, nested in list(value.items()):
-            if key in SERVICE_SECRET_FIELDS and nested:
-                value[key] = _mask_secret_value(nested)
-            else:
-                _mask_secret_fields(nested)
-    elif isinstance(value, list):
-        for item in value:
-            _mask_secret_fields(item)
-
-
-def _mask_secret_value(value):
-    if isinstance(value, list):
-        return [mask_key(item) for item in value]
-    return mask_key(value)
-
-
-def _convert_any_dograh_legacy_configuration(
-    configuration: EffectiveAIModelConfiguration,
-    dograh_key: str,
-) -> OrganizationAIModelConfigurationV2:
-    speed = getattr(configuration.tts, "speed", 1.0)
-    try:
-        speed = float(speed)
-    except (TypeError, ValueError):
-        speed = 1.0
-    if not DOGRAH_SPEED_MIN <= speed <= DOGRAH_SPEED_MAX:
-        speed = 1.0
-    return OrganizationAIModelConfigurationV2(
-        mode="dograh",
-        dograh=DograhManagedAIModelConfiguration(
-            api_key=dograh_key,
-            voice=getattr(configuration.tts, "voice", DOGRAH_DEFAULT_VOICE)
-            or DOGRAH_DEFAULT_VOICE,
-            speed=speed,
-            language=getattr(configuration.stt, "language", DOGRAH_DEFAULT_LANGUAGE)
-            or DOGRAH_DEFAULT_LANGUAGE,
-        ),
-    )
-
-
-def _first_dograh_api_key(configuration: EffectiveAIModelConfiguration) -> str | None:
-    for service in (
-        configuration.llm,
-        configuration.tts,
-        configuration.stt,
-        configuration.embeddings,
-        configuration.realtime,
-    ):
-        if service is None or _provider(service) != ServiceProviders.DOGRAH:
-            continue
-        try:
-            return _single_api_key(service)
-        except ValueError:
-            continue
-    return None
-
-
-def _provider(service):
-    return getattr(service, "provider", None)
-
-
-def _single_api_key(service) -> str:
-    if hasattr(service, "get_all_api_keys"):
-        keys = service.get_all_api_keys()
-        if len(keys) != 1:
-            raise ValueError("Expected exactly one API key")
-        return keys[0]
-    key = getattr(service, "api_key", None)
-    if not key:
-        raise ValueError("Expected an API key")
-    return key

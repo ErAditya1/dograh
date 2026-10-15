@@ -1,14 +1,13 @@
 from copy import deepcopy
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
 from api.constants import (
     DEFAULT_CAMPAIGN_RETRY_CONFIG,
     DEFAULT_ORG_CONCURRENCY_LIMIT,
-    DEPLOYMENT_MODE,
 )
 from api.db import db_client
 from api.db.models import UserModel
@@ -20,17 +19,6 @@ from api.db.telephony_phone_number_client import TelephonyPhoneNumberConflictErr
 from api.db.telephony_trunk_client import TelephonyTrunkConflictError
 from api.enums import OrganizationConfigurationKey, PostHogEvent
 from api.errors.failure import ErrorSource, classify_exception, log_failure
-from api.errors.mps import MPSUnavailableError
-from api.schemas.ai_model_configuration import (
-    DOGRAH_DEFAULT_LANGUAGE,
-    DOGRAH_DEFAULT_VOICE,
-    DOGRAH_SPEED_MAX,
-    DOGRAH_SPEED_MIN,
-    DOGRAH_SPEED_OPTIONS,
-    DOGRAH_SPEED_STEP,
-    OrganizationAIModelConfigurationResponse,
-    OrganizationAIModelConfigurationV2,
-)
 from api.schemas.call_events import CallEventsConnectionResult, CallEventsSettings
 from api.schemas.organization_preferences import (
     OrganizationPreferences,
@@ -52,6 +40,8 @@ from api.schemas.telephony_phone_number import (
     PhoneNumberCreateRequest,
     PhoneNumberListResponse,
     PhoneNumberResponse,
+    PhoneNumberSyncResponse,
+    PhoneNumberSyncSkipped,
     PhoneNumberUpdateRequest,
     ProviderSyncStatus,
 )
@@ -111,6 +101,10 @@ from api.services.telephony.inbound_routing import (
     InboundRoutingConflictError,
     assert_no_inbound_routing_conflict,
     canonical_address,
+)
+from api.services.telephony.phone_number_sync import (
+    PhoneNumberSyncUnsupportedError,
+    sync_phone_numbers_from_provider,
 )
 from api.services.telephony.registry import ProviderConnectivity, TrunkDesiredState
 from api.services.worker_sync.manager import get_worker_sync_manager
@@ -192,6 +186,9 @@ class TelephonyProviderMetadata(BaseModel):
     # Lets the UI present the two ways to get calls flowing without naming any
     # provider itself.
     connectivity: ProviderConnectivity = "api"
+    # False for an inbound-only channel: the form then offers no outbound
+    # default, again without the UI naming the provider.
+    supports_outbound: bool = True
     fields: List[TelephonyProviderUIField]
     docs_url: Optional[str] = None
 
@@ -221,13 +218,6 @@ class ModelConfigurationMetricPrice(BaseModel):
     price_per_minute: float
     currency: str
     rounding_policy: str
-
-
-class ModelConfigurationPricingResponse(BaseModel):
-    """MPS-owned effective prices relevant to model configuration choices."""
-
-    platform_usage: ModelConfigurationMetricPrice | None = None
-    dograh_model: ModelConfigurationMetricPrice | None = None
 
 
 @router.get("/context", response_model=OrganizationContextResponse)
@@ -265,6 +255,7 @@ async def get_telephony_providers_metadata(user: UserModel = Depends(get_user)):
                 provider=spec.name,
                 display_name=spec.ui_metadata.display_name,
                 connectivity=spec.connectivity,
+                supports_outbound=spec.supports_outbound,
                 fields=[
                     TelephonyProviderUIField(
                         name=f.name,
@@ -983,6 +974,7 @@ async def list_telephony_configurations(user: UserModel = Depends(get_user)):
                 [n for n in active if n.telephony_trunk_id is None]
             ),
         )
+        supports_outbound = _provider_supports_outbound(row.provider)
         is_platform = (
             bool(getattr(row, "is_platform_inventory", False))
             or (bool(row.name) and row.name.startswith("Platform - "))
@@ -1010,8 +1002,9 @@ async def list_telephony_configurations(user: UserModel = Depends(get_user)):
                 inactive_since=row.inactive_since,
                 inactive_reason=row.inactive_reason,
                 phone_number_count=len(active),
+                supports_outbound=supports_outbound,
                 is_ready_for_outbound=(
-                    checklist.ready_for_outbound if checklist else True
+                    checklist.ready_for_outbound if checklist else supports_outbound
                 ),
                 outbound_blocked_reason=(
                     checklist.outbound_blocked_reason if checklist else None
@@ -1034,6 +1027,14 @@ async def create_telephony_configuration(
     """Create a new telephony configuration for the org."""
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
+
+    if request.is_default_outbound and not _provider_supports_outbound(
+        request.config.provider
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="This provider receives calls only; it cannot be the outbound default.",
+        )
 
     credentials = _credentials_from_payload(request.config)
     credentials = await _run_preprocess_hook(request.config.provider, credentials)
@@ -1196,6 +1197,17 @@ async def set_default_outbound(config_id: int, user: UserModel = Depends(get_use
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
+    existing = await db_client.get_telephony_configuration_for_org(
+        config_id, user.selected_organization_id, active_only=False
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Telephony configuration not found")
+    if not _provider_supports_outbound(existing.provider):
+        raise HTTPException(
+            status_code=400,
+            detail="This provider receives calls only; it cannot be the outbound default.",
+        )
+
     row = await db_client.set_default_telephony_configuration(
         config_id, user.selected_organization_id
     )
@@ -1305,6 +1317,7 @@ async def _detail_response(row) -> TelephonyConfigurationDetail:
         sip_connectivity=None if is_platform else get_sip_connectivity_details(
             row.provider, row.credentials or {}
         ),
+        supports_outbound=_provider_supports_outbound(row.provider),
         # Built from the stored (unmasked) credentials: the checklist reports
         # whether a field is set, never what it is.
         setup_checklist=None if is_platform else get_setup_checklist(
@@ -1327,6 +1340,7 @@ async def _detail_response(row) -> TelephonyConfigurationDetail:
         is_shared_trial=is_shared,
         is_platform_inventory=is_platform,
         is_claimed=is_claimed_cfg,
+        supports_phone_number_sync=_provider_supports_phone_number_sync(row.provider),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -1340,6 +1354,17 @@ async def _detail_response(row) -> TelephonyConfigurationDetail:
 def _provider_supports_trunks(provider: str) -> bool:
     spec = telephony_registry.get_optional(provider)
     return bool(spec and spec.supports_trunks)
+
+
+def _provider_supports_outbound(provider: str) -> bool:
+    """Unknown providers count as outbound-capable so a stale row keeps its UI."""
+    spec = telephony_registry.get_optional(provider)
+    return spec.supports_outbound if spec else True
+
+
+def _provider_supports_phone_number_sync(provider: str) -> bool:
+    spec = telephony_registry.get_optional(provider)
+    return bool(spec and spec.supports_phone_number_sync)
 
 
 async def _list_trunks_if_supported(provider: str, config_id: int):
@@ -1609,6 +1634,63 @@ async def list_phone_numbers(config_id: int, user: UserModel = Depends(get_user)
     rows = await db_client.list_phone_numbers_with_workflow_name_for_config(config_id)
     return PhoneNumberListResponse(
         phone_numbers=[_phone_number_to_response(r, name) for r, name in rows]
+    )
+
+
+@router.post(
+    "/telephony-configs/{config_id}/phone-numbers/sync",
+    response_model=PhoneNumberSyncResponse,
+)
+async def sync_phone_numbers(config_id: int, user: UserModel = Depends(get_user)):
+    """Import the provider account's numbers onto this configuration.
+
+    Adds rows for numbers the account holds and refreshes the ones already
+    here. Nothing is removed: numbers the provider no longer lists come back
+    as ``missing_at_provider`` for the operator to act on.
+    """
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    cfg = await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
+
+    provider = None
+    try:
+        provider = await get_telephony_provider_by_id(
+            config_id, user.selected_organization_id
+        )
+        outcome = await sync_phone_numbers_from_provider(
+            configuration=cfg,
+            organization_id=user.selected_organization_id,
+            provider=provider,
+        )
+    except PhoneNumberSyncUnsupportedError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except ProviderPhoneNumberLookupError as e:
+        # The listing runs against the org's own provider account, so whatever
+        # failed — their credentials or their provider — routes to the user.
+        log_failure(
+            classify_exception(
+                e.__cause__ or e,
+                source=ErrorSource.TELEPHONY,
+                provider=getattr(provider, "PROVIDER_NAME", None),
+                error_owner="user",
+            ),
+            organization_id=user.selected_organization_id,
+            telephony_configuration_id=config_id,
+        )
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    return PhoneNumberSyncResponse(
+        created=[_phone_number_to_response(r) for r in outcome.created],
+        updated=[_phone_number_to_response(r) for r in outcome.updated],
+        skipped=[
+            PhoneNumberSyncSkipped(address=s.address, reason=s.reason)
+            for s in outcome.skipped
+        ],
+        missing_at_provider=[
+            _phone_number_to_response(r) for r in outcome.missing_at_provider
+        ],
     )
 
 

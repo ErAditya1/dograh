@@ -1,15 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Literal
+from pydantic import BaseModel, model_validator
 
-from pydantic import BaseModel, Field, model_validator
-
+from api.schemas.llm_fallback import FallbackPolicy
 from api.services.configuration.registry import (
-    DograhEmbeddingsConfiguration,
-    DograhLLMService,
-    DograhSTTService,
-    DograhTTSService,
     EmbeddingsConfig,
     LLMConfig,
     RealtimeConfig,
@@ -18,16 +12,10 @@ from api.services.configuration.registry import (
     TTSConfig,
 )
 
-DOGRAH_SPEED_MIN = 0.5
-DOGRAH_SPEED_MAX = 2.0
-DOGRAH_SPEED_STEP = 0.1
-DOGRAH_SPEED_OPTIONS: tuple[float, ...] = (0.8, 1.0, 1.2)
-DOGRAH_DEFAULT_VOICE = "default"
-DOGRAH_DEFAULT_LANGUAGE = "multi"
-
 
 class EffectiveAIModelConfiguration(BaseModel):
     llm: LLMConfig | None = None
+    llm_fallback: FallbackPolicy[LLMConfig] | None = None
     stt: STTConfig | None = None
     tts: TTSConfig | None = None
     embeddings: EmbeddingsConfig | None = None
@@ -38,6 +26,21 @@ class EffectiveAIModelConfiguration(BaseModel):
     timezone: str | None = None
     last_validated_at: datetime | None = None
     use_platform_credentials: bool = False
+
+    @model_validator(mode="after")
+    def require_byok_llm_fallback(self):
+        if not self.llm_fallback or not self.llm_fallback.rules:
+            return self
+        if self.llm is None or self.llm.provider == ServiceProviders.DOGRAH:
+            raise ValueError("LLM fallbacks require a non-Dograh primary LLM")
+        if any(
+            rule.target.provider == ServiceProviders.DOGRAH
+            for rule in self.llm_fallback.rules
+        ):
+            raise ValueError(
+                "Dograh manages its own fallbacks and cannot be a fallback target"
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -194,3 +197,4 @@ def _reject_dograh_provider(section: str, service) -> None:
         return
     if getattr(service, "provider", None) == ServiceProviders.DOGRAH:
         raise ValueError(f"BYOK {section} cannot use Dograh provider")
+
