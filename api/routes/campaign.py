@@ -1258,6 +1258,7 @@ def resolve_call_intent(
 async def get_all_organization_calls(
     page: int = Query(1, ge=1),
     limit: int = Query(100, ge=1, le=200),
+    campaign_id: Optional[int] = Query(None),
     user: UserModel = Depends(get_user),
 ) -> Dict[str, Any]:
     """
@@ -1286,15 +1287,17 @@ async def get_all_organization_calls(
         wf_map = {row.id: row.name for row in wf_res.all()}
 
         # 3. Query all workflow runs belonging to this organization:
-        # - Either run.campaign_id in camp_ids
-        # - Or workflow.organization_id == org_id
-        # - Or run.extra->>'organization_id' = str(org_id)
-        org_filter_clauses = [
-            WorkflowModel.organization_id == org_id,
-            text("workflow_runs.extra->>'organization_id' = :org_id_str"),
-        ]
-        if camp_ids:
-            org_filter_clauses.append(WorkflowRunModel.campaign_id.in_(camp_ids))
+        # - If campaign_id is explicitly provided, filter directly to that campaign
+        # - Otherwise, match run.campaign_id in camp_ids, or workflow.org_id, or extra.org_id
+        if campaign_id is not None:
+            org_filter_clauses = [WorkflowRunModel.campaign_id == campaign_id]
+        else:
+            org_filter_clauses = [
+                WorkflowModel.organization_id == org_id,
+                text("workflow_runs.extra->>'organization_id' = :org_id_str"),
+            ]
+            if camp_ids:
+                org_filter_clauses.append(WorkflowRunModel.campaign_id.in_(camp_ids))
 
         # Count query for pagination metadata
         count_query = (
@@ -2186,9 +2189,18 @@ async def get_campaign_run_detail(
         except Exception:
             pass
 
+    summary = (
+        gathered.get("call_summary")
+        or gathered.get("summary")
+        or (run.logs or {}).get("summary")
+        or (run.extra or {}).get("summary")
+        or ""
+    )
+
     return {
         "id": run.id,
         "campaign_id": run.campaign_id,
+        "workflow_id": run.workflow_id,
         "phone": phone,
         "name": name,
         "status": status,
@@ -2196,6 +2208,7 @@ async def get_campaign_run_detail(
         "workflow_name": wf_name,
         "duration_seconds": duration_sec,
         "intent": intent,
+        "summary": summary,
         "recording_url": resolved_recording_url,
         "transcript_url": resolved_transcript_url,
         "user_recording_url": resolved_user_recording_url,
@@ -2702,6 +2715,8 @@ async def get_campaign_contacts(
                         c["called"] = True
                         c["durationSec"] = duration_sec
                         c["intent"] = derived_intent or c.get("intent")
+                        c["run_id"] = wf.id
+                        c["runId"] = wf.id
                         if wf.created_at:
                             c["lastCalledAt"] = wf.created_at.isoformat()
                         matched = True
@@ -2711,6 +2726,8 @@ async def get_campaign_contacts(
                 seen_phones.add(phone_val)
                 contacts.append({
                     "id": f"wf_{wf.id}",
+                    "run_id": wf.id,
+                    "runId": wf.id,
                     "name": init_c.get("name") or "Customer",
                     "phone": phone_val,
                     "email": init_c.get("email") or "",
