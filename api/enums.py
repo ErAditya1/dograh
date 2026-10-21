@@ -68,6 +68,7 @@ class WorkflowRunMode(Enum):
     VOBIZ = "vobiz"
     CLOUDONIX = "cloudonix"
     EXOTEL = "exotel"
+    TELNYX = "telnyx"
     SMARTFLO = "smartflo"
     WHATSAPP = "whatsapp"
     WEBRTC = "webrtc"
