@@ -70,7 +70,7 @@ class Webhook(TypedNode):
     Additional HTTP headers to include with the request.
     """
 
-    payload_template: dict[str, Any] = field(default_factory=lambda: {'call_id': '{{workflow_run_id}}', 'first_name': '{{initial_context.first_name}}', 'rsvp': '{{gathered_context.rsvp}}', 'duration': '{{cost_info.call_duration_seconds}}', 'recording_url': '{{recording_url}}', 'user_recording_url': '{{user_recording_url}}', 'bot_recording_url': '{{bot_recording_url}}', 'transcript_url': '{{transcript_url}}'})
+    payload_template: dict[str, Any] = field(default_factory=lambda: {'call_id': '{{workflow_run_id}}', 'phone_number': '{{initial_context.called_number}}', 'duration': '{{cost_info.call_duration_seconds}}', 'call_disposition': '{{gathered_context.call_disposition}}', 'extracted_variables': '{{gathered_context}}', 'post_call_analysis': '{{annotations}}', 'recording_url': '{{recording_url}}', 'transcript_url': '{{transcript_url}}'})
     """
     JSON body of the request. Values are Jinja-rendered against the run
     context — `{{workflow_run_id}}`, `{{gathered_context.foo}}`,

@@ -159,7 +159,7 @@ class PlanService:
                 "ALTER TABLE telephony_phone_numbers ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ",
                 "ALTER TABLE telephony_phone_numbers ADD COLUMN IF NOT EXISTS next_rental_billing_at TIMESTAMPTZ",
                 "ALTER TABLE telephony_phone_numbers ADD COLUMN IF NOT EXISTS rental_status VARCHAR(32) DEFAULT 'active'",
-                "UPDATE subscription_plans SET name = 'Agency Scale Pack' WHERE slug = 'simple_agency'",
+                "UPDATE subscription_plans SET name = 'Agency Scale Pack', included_minutes = 3500 WHERE slug = 'simple_agency'",
                 """CREATE TABLE IF NOT EXISTS sales_inquiries (
                     id SERIAL PRIMARY KEY,
                     organization_id INT,
@@ -365,7 +365,7 @@ class PlanService:
                     "price_usd": 240.0,
                     "price_inr": 19999.0,
                     "billing_interval": "month",
-                    "included_minutes": 10000,
+                    "included_minutes": 3500,
                     "monthly_credits_usd": 240.0,
                     "included_phone_numbers": 1,
                     "max_concurrent_calls": 15,
@@ -378,7 +378,7 @@ class PlanService:
                     "is_active": True,
                     "is_public": True,
                     "features": [
-                        "Unlimited calling under fair use (10,000 mins)",
+                        "3,500 calling minutes included / mo",
                         "Dedicated calling number included",
                         "15 High-throughput concurrent lines",
                         "Team access and roles",
@@ -424,6 +424,9 @@ class PlanService:
                         existing.features = p["features"]
                         existing.price_inr = p["price_inr"]
                         existing.price_usd = p["price_usd"]
+                        existing.included_minutes = p["included_minutes"]
+                        existing.max_concurrent_calls = p["max_concurrent_calls"]
+                        existing.max_agents = p["max_agents"]
                         existing.overage_rate_per_minute_usd = p["overage_rate_per_minute_usd"]
                         existing.allow_byok = p["allow_byok"]
                         existing.allow_live_transfer = p["allow_live_transfer"]

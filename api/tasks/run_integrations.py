@@ -428,17 +428,54 @@ def _build_webhook_payload(
 ) -> Any:
     """Render the webhook payload once, so retries are deterministic.
 
-    Always surfaces the call disposition on the outgoing payload, even when the
-    template author didn't reference it. Fill only if absent so a template that
-    sets it explicitly keeps its own value.
+    Always surfaces the call disposition, extracted variables, post-call analysis,
+    and recording/transcript URLs on the outgoing payload so end-users receive
+    complete call data out-of-the-box without needing complex Jinja template configurations.
     """
     payload = render_template(webhook_data.payload_template or {}, render_context)
 
     if isinstance(payload, dict):
         gathered_context = render_context.get("gathered_context") or {}
+        annotations = render_context.get("annotations") or {}
+        cost_info = render_context.get("cost_info") or {}
+        initial_context = render_context.get("initial_context") or {}
+
+        # Remove outdated dummy defaults if empty
+        if payload.get("first_name") == "":
+            payload.pop("first_name", None)
+        if payload.get("rsvp") == "":
+            payload.pop("rsvp", None)
+
         payload.setdefault(
             "call_disposition", gathered_context.get("call_disposition", "")
         )
+
+        if cost_info.get("call_duration_seconds") is not None:
+            payload.setdefault("duration", str(cost_info.get("call_duration_seconds")))
+
+        phone = initial_context.get("called_number") or initial_context.get("phone_number")
+        if phone:
+            payload.setdefault("phone_number", str(phone))
+
+        # Automatically surface all extracted variables (BANT / custom answers)
+        if gathered_context:
+            clean_gathered = {k: v for k, v in gathered_context.items() if k != "call_disposition"}
+            if clean_gathered:
+                payload.setdefault("extracted_variables", clean_gathered)
+
+        # Automatically surface post-call QA / intent analysis if present
+        if annotations:
+            payload.setdefault("post_call_analysis", annotations)
+
+        # Ensure artifact URLs are present
+        if render_context.get("transcript_url"):
+            payload.setdefault("transcript_url", render_context.get("transcript_url"))
+        if render_context.get("recording_url"):
+            payload.setdefault("recording_url", render_context.get("recording_url"))
+        if render_context.get("user_recording_url"):
+            payload.setdefault("user_recording_url", render_context.get("user_recording_url"))
+        if render_context.get("bot_recording_url"):
+            payload.setdefault("bot_recording_url", render_context.get("bot_recording_url"))
 
     return payload
 
