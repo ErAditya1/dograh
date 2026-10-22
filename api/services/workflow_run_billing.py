@@ -273,6 +273,7 @@ async def report_workflow_run_platform_usage(workflow_run) -> None:
                 workflow_run.id,
                 e,
             )
+            raise
 
 
 async def report_completed_workflow_run_platform_usage(workflow_run_id: int) -> None:

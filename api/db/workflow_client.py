@@ -1136,7 +1136,9 @@ class WorkflowClient(BaseDBClient):
 
         async with self.async_session() as session:
             result = await session.execute(
-                select(WorkflowModel).where(WorkflowModel.id == workflow_id)
+                select(WorkflowModel)
+                .where(WorkflowModel.id == workflow_id)
+                .with_for_update()
             )
             workflow = result.scalars().first()
             if not workflow:
@@ -1158,3 +1160,4 @@ class WorkflowClient(BaseDBClient):
                     f"Failed to add disposition code '{disposition_code}' "
                     f"to workflow {workflow_id}: {e}"
                 )
+                raise
