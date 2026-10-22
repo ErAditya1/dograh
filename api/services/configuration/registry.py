@@ -1935,7 +1935,7 @@ class LmntTTSConfiguration(BaseTTSConfiguration):
     )
 
 
-@register_tts
+@register_tts(provider=RUMIK_PROVIDER)
 class RumikTTSConfiguration(BaseTTSConfiguration):
     model_config = RUMIK_PROVIDER_MODEL_CONFIG
     provider: Literal[ServiceProviders.RUMIK] = ServiceProviders.RUMIK
