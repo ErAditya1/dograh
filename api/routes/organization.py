@@ -1,13 +1,14 @@
 from copy import deepcopy
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger
 from pydantic import BaseModel, Field, ValidationError
 
 from api.constants import (
     DEFAULT_CAMPAIGN_RETRY_CONFIG,
     DEFAULT_ORG_CONCURRENCY_LIMIT,
+    DEPLOYMENT_MODE,
 )
 from api.db import db_client
 from api.db.models import UserModel
@@ -19,6 +20,7 @@ from api.db.telephony_phone_number_client import TelephonyPhoneNumberConflictErr
 from api.db.telephony_trunk_client import TelephonyTrunkConflictError
 from api.enums import OrganizationConfigurationKey, PostHogEvent
 from api.errors.failure import ErrorSource, classify_exception, log_failure
+from api.errors.mps import MPSUnavailableError
 from api.schemas.call_events import CallEventsConnectionResult, CallEventsSettings
 from api.schemas.organization_preferences import (
     OrganizationPreferences,
@@ -48,6 +50,16 @@ from api.schemas.telephony_phone_number import (
 from api.services.auth.depends import (
     get_user,
     get_user_with_selected_organization,
+)
+from api.schemas.ai_model_configuration import (
+    DOGRAH_DEFAULT_LANGUAGE,
+    DOGRAH_DEFAULT_VOICE,
+    DOGRAH_SPEED_MAX,
+    DOGRAH_SPEED_MIN,
+    DOGRAH_SPEED_OPTIONS,
+    DOGRAH_SPEED_STEP,
+    OrganizationAIModelConfigurationResponse,
+    OrganizationAIModelConfigurationV2,
 )
 from api.services.configuration.ai_model_configuration import (
     check_for_masked_keys_in_ai_model_configuration_v2,
@@ -489,6 +501,22 @@ async def get_model_configuration_v2(
     user: UserModel = Depends(get_user_with_selected_organization),
 ):
     return await _model_configuration_v2_response(user=user)
+
+
+class ModelConfigurationMetricPrice(BaseModel):
+    metric_code: str
+    display_name: str
+    unit: str
+    price_per_minute: float
+    currency: str
+    rounding_policy: str
+
+
+class ModelConfigurationPricingResponse(BaseModel):
+    """MPS-owned effective prices relevant to model configuration choices."""
+
+    platform_usage: ModelConfigurationMetricPrice | None = None
+    dograh_model: ModelConfigurationMetricPrice | None = None
 
 
 @router.get(

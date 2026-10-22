@@ -2,16 +2,45 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import HTTPException
+from loguru import logger
+from pydantic import ValidationError
 
 from api.constants import MPS_API_URL
-from api.schemas.ai_model_configuration import EffectiveAIModelConfiguration
+from api.db import db_client
+from api.db.models import OrganizationConfigurationModel
+from api.enums import OrganizationConfigurationKey
+from api.schemas.ai_model_configuration import (
+    DOGRAH_DEFAULT_LANGUAGE,
+    DOGRAH_DEFAULT_VOICE,
+    DOGRAH_SPEED_MAX,
+    DOGRAH_SPEED_MIN,
+    DOGRAH_SPEED_OPTIONS,
+    BYOKAIModelConfiguration,
+    BYOKPipelineAIModelConfiguration,
+    BYOKRealtimeAIModelConfiguration,
+    DograhManagedAIModelConfiguration,
+    EffectiveAIModelConfiguration,
+    OrganizationAIModelConfigurationV2,
+    compile_ai_model_configuration_v2,
+)
+from api.services.configuration.masking import (
+    SERVICE_SECRET_FIELDS,
+    contains_masked_key,
+    mask_key,
+    resolve_masked_api_keys,
+)
 from api.services.configuration.registry import ServiceProviders
+from api.services.configuration.resolve import resolve_effective_config
 
-AIModelConfigurationSource = Literal["organization_v3", "empty"]
+AIModelConfigurationSource = Literal[
+    "organization_v3", "organization_v2", "platform_defaults", "legacy_user_v1", "empty"
+]
 # Retired inline workflow key. Rows converted by the catalog backfill keep it
 # as audit data; no code reads it, and saves drop it.
 WORKFLOW_MODEL_CONFIGURATION_V2_OVERRIDE_KEY = "model_configuration_v2_override"
@@ -21,6 +50,14 @@ WORKFLOW_MODEL_CONFIGURATION_V2_OVERRIDE_KEY = "model_configuration_v2_override"
 class ResolvedAIModelConfiguration:
     effective: EffectiveAIModelConfiguration
     source: AIModelConfigurationSource
+    organization_configuration: OrganizationAIModelConfigurationV2 | None = None
+
+
+@dataclass
+class WorkflowAIModelConfigurationMigrationResult:
+    workflow_count: int = 0
+    definition_count: int = 0
+    workflow_ids: list[int] | None = None
 
 
 def populate_effective_config_from_platform_defaults(

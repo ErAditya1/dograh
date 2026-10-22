@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, model_validator
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, Field, model_validator
 
 from api.schemas.llm_fallback import FallbackPolicy
 from api.services.configuration.registry import (
+    DograhEmbeddingsConfiguration,
+    DograhLLMService,
+    DograhSTTService,
+    DograhTTSService,
     EmbeddingsConfig,
     LLMConfig,
     RealtimeConfig,
@@ -11,6 +18,13 @@ from api.services.configuration.registry import (
     STTConfig,
     TTSConfig,
 )
+
+DOGRAH_SPEED_MIN = 0.5
+DOGRAH_SPEED_MAX = 2.0
+DOGRAH_SPEED_STEP = 0.1
+DOGRAH_SPEED_OPTIONS: tuple[float, ...] = (0.8, 1.0, 1.2)
+DOGRAH_DEFAULT_VOICE = "default"
+DOGRAH_DEFAULT_LANGUAGE = "multi"
 
 
 class EffectiveAIModelConfiguration(BaseModel):
