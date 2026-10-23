@@ -70,6 +70,7 @@ from api.services.configuration.ai_model_configuration import (
     mask_ai_model_configuration_v2,
     merge_ai_model_configuration_v2_secrets,
     migrate_workflow_model_configurations_to_v2,
+    populate_effective_config_from_platform_defaults,
     upsert_organization_ai_model_configuration_v2,
 )
 from api.services.configuration.check_validity import UserConfigurationValidator
@@ -363,8 +364,22 @@ async def _model_configuration_v2_response(
     raw_configuration = (
         configuration
         if configuration is not None
-        else resolved.organization_configuration
+        else (
+            resolved.organization_configuration
+            or await get_organization_ai_model_configuration_v2(
+                user.selected_organization_id
+            )
+        )
     )
+    if raw_configuration is not None:
+        effective = compile_ai_model_configuration_v2(raw_configuration)
+        effective = populate_effective_config_from_platform_defaults(effective)
+        return OrganizationAIModelConfigurationResponse(
+            configuration=mask_ai_model_configuration_v2(raw_configuration),
+            effective_configuration=mask_user_config(effective),
+            source="organization_v2",
+        )
+
     return OrganizationAIModelConfigurationResponse(
         configuration=mask_ai_model_configuration_v2(raw_configuration),
         effective_configuration=mask_user_config(resolved.effective),

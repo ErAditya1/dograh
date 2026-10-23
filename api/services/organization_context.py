@@ -10,7 +10,7 @@ from api.services.configuration.ai_model_configuration import (
 
 
 class OrganizationModelServicesContext(BaseModel):
-    config_source: Literal["organization_v3", "empty"]
+    config_source: Literal["organization_v2", "organization_v3", "platform_defaults", "empty"] | str
     managed_service_version: Optional[int] = None
     uses_managed_service_v2: bool
 

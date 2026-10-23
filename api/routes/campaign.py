@@ -2453,6 +2453,9 @@ async def stream_run_audio(
     except HTTPException:
         raise
     except Exception as exc:
+        err_str = str(exc)
+        if "NoSuchKey" in err_str or "NotFound" in err_str or "not found" in err_str.lower() or "does not exist" in err_str.lower():
+            raise HTTPException(status_code=404, detail="Audio file not found in storage")
         logger.error(f"Failed to stream audio for run {run_id}: {exc}")
         raise HTTPException(status_code=500, detail="Could not read audio file")
 

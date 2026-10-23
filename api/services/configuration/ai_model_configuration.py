@@ -154,24 +154,6 @@ async def get_resolved_ai_model_configuration(
     organization_id: int | None,
 ) -> ResolvedAIModelConfiguration:
     """Resolve the effective model configuration for an organization."""
-    if organization_id is not None:
-        try:
-            from api.services.configuration.model_connections import (
-                get_default_model_configuration,
-                resolve_model_configuration,
-            )
-
-            default = await get_default_model_configuration(organization_id)
-            if default is not None:
-                resolved = await resolve_model_configuration(
-                    organization_id, default_row=default
-                )
-                return ResolvedAIModelConfiguration(
-                    effective=resolved.effective, source="organization_v3"
-                )
-        except Exception as e:
-            logger.debug("Could not resolve v3 model configuration: {}", e)
-
     organization_configuration_row = (
         await _get_organization_ai_model_configuration_v2_row(organization_id)
     )
@@ -179,6 +161,55 @@ async def get_resolved_ai_model_configuration(
         organization_configuration_row,
         organization_id,
     )
+
+    if organization_id is not None:
+        try:
+            from api.services.configuration.model_connections import (
+                DEFAULT_KEY,
+                get_default_model_configuration,
+                resolve_model_configuration,
+            )
+
+            default = await get_default_model_configuration(organization_id)
+            if default is not None:
+                default_pointer = await db_client.get_configuration(organization_id, DEFAULT_KEY)
+                v2_updated = (
+                    organization_configuration_row.updated_at or organization_configuration_row.last_validated_at
+                    if organization_configuration_row
+                    else None
+                )
+                v3_updated = default_pointer.updated_at if default_pointer else getattr(default, "updated_at", None)
+
+                # If V2 was updated after V3 default was set/updated, V2 takes precedence
+                if (
+                    v2_updated
+                    and v3_updated
+                    and v2_updated > v3_updated
+                    and organization_configuration is not None
+                ):
+                    effective = compile_ai_model_configuration_v2(organization_configuration)
+                    effective = populate_effective_config_from_platform_defaults(effective)
+                    if organization_configuration_row is not None:
+                        effective.last_validated_at = (
+                            organization_configuration_row.last_validated_at
+                        )
+                    return ResolvedAIModelConfiguration(
+                        effective=effective,
+                        source="organization_v2",
+                        organization_configuration=organization_configuration,
+                    )
+
+                resolved = await resolve_model_configuration(
+                    organization_id, default_row=default
+                )
+                return ResolvedAIModelConfiguration(
+                    effective=resolved.effective,
+                    source="organization_v3",
+                    organization_configuration=organization_configuration,
+                )
+        except Exception as e:
+            logger.debug("Could not resolve v3 model configuration: {}", e)
+
     if organization_configuration is not None:
         effective = compile_ai_model_configuration_v2(organization_configuration)
         effective = populate_effective_config_from_platform_defaults(effective)
