@@ -221,6 +221,7 @@ class WorkflowRunTextSessionClient(BaseDBClient):
         gathered_context: dict,
         logs: dict,
         state: str,
+        cost_info: dict | None = None,
         checkpoint: dict | None = None,
         initial_context: dict | None = None,
     ) -> WorkflowRunTextSessionModel:
@@ -260,6 +261,11 @@ class WorkflowRunTextSessionClient(BaseDBClient):
             text_session.revision += 1
 
             workflow_run.usage_info = usage_info
+            if cost_info is not None:
+                workflow_run.cost_info = {
+                    **(workflow_run.cost_info or {}),
+                    **cost_info,
+                }
             if initial_context:
                 workflow_run.initial_context = {
                     **(workflow_run.initial_context or {}),

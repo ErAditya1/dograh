@@ -234,15 +234,29 @@ def _build_text_chat_completion_write(
         if value not in call_tags:
             call_tags.append(value)
 
-    usage_info = dict(workflow_run.usage_info or {})
-    usage_info["call_duration_seconds"] = _text_chat_duration_seconds(
+    duration_secs = _text_chat_duration_seconds(
         text_session,
         completed_at=completed_at,
+    )
+    usage_info = dict(workflow_run.usage_info or {})
+    usage_info["call_duration_seconds"] = duration_secs
+
+    cost_info = dict(workflow_run.cost_info or {})
+    cost_info.update(
+        {
+            "total_cost_usd": 0.0,
+            "charge_usd": 0.0,
+            "rate_per_minute": 0.0,
+            "call_duration_seconds": duration_secs,
+            "rates": {"rate_per_minute": 0.0},
+            "charged_to": "text_chat_free",
+        }
     )
 
     return {
         "session_data": completed_session_data,
         "usage_info": usage_info,
+        "cost_info": cost_info,
         "gathered_context": {
             **extracted,
             "call_disposition": disposition,

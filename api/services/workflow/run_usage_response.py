@@ -14,7 +14,9 @@ def format_public_usage_info(usage_info: dict | None) -> dict | None:
 
 
 def format_public_cost_info(
-    cost_info: dict | None, usage_info: dict | None
+    cost_info: dict | None,
+    usage_info: dict | None,
+    mode: str | None = None,
 ) -> dict | None:
     """Return the legacy response shape without doing local cost accounting."""
     duration = None
@@ -32,13 +34,20 @@ def format_public_cost_info(
                 float(cost_info.get("total_cost_usd", 0)) * 100, 2
             )
 
-    if duration is None and dograh_token_usage == 0:
+    if duration is None and dograh_token_usage == 0 and mode != "textchat":
         return None
 
     result = {
         "dograh_token_usage": dograh_token_usage,
         "call_duration_seconds": duration,
     }
+
+    # Text chat does not incur telephony/STT/TTS minute costs
+    if mode == "textchat":
+        result["charge_usd"] = 0.0
+        result["total_cost_usd"] = 0.0
+        result["rate_per_minute"] = 0.0
+        result["rates"] = {"rate_per_minute": 0.0}
 
     # Include actual billing fields if available
     if cost_info:

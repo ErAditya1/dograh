@@ -410,7 +410,9 @@ class WorkflowRunClient(BaseDBClient):
                             run.extra, "bot"
                         ),
                         "cost_info": format_public_cost_info(
-                            run.cost_info, run.usage_info
+                            run.cost_info,
+                            run.usage_info,
+                            mode=getattr(run, "mode", None),
                         ),
                         "usage_info": run.usage_info,
                         "annotations": run.annotations,

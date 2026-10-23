@@ -1573,7 +1573,9 @@ async def get_workflow_run(
             else None
         ),
         "public_access_token": public_access_token,
-        "cost_info": format_public_cost_info(run.cost_info, run.usage_info),
+        "cost_info": format_public_cost_info(
+            run.cost_info, run.usage_info, mode=getattr(run, "mode", None)
+        ),
         "usage_info": format_public_usage_info(run.usage_info),
         "created_at": run.created_at,
         "definition_id": run.definition_id,

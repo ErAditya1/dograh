@@ -47,6 +47,25 @@ async def report_workflow_run_platform_usage(workflow_run) -> None:
             "Skipping platform usage report for text chat workflow run {}",
             workflow_run.id,
         )
+        try:
+            duration_seconds = _duration_seconds_from_usage_info(workflow_run) or 0
+            cost_info = getattr(workflow_run, "cost_info", None) or {}
+            cost_info.update(
+                {
+                    "total_cost_usd": 0.0,
+                    "charge_usd": 0.0,
+                    "rate_per_minute": 0.0,
+                    "call_duration_seconds": duration_seconds,
+                    "rates": {"rate_per_minute": 0.0},
+                    "charged_to": "text_chat_free",
+                }
+            )
+            if hasattr(db_client, "update_workflow_run"):
+                await db_client.update_workflow_run(
+                    workflow_run.id, cost_info=cost_info
+                )
+        except Exception as e:
+            logger.warning("Failed to persist zero cost_info for text chat run {}: {}", workflow_run.id, e)
         return
 
     if not getattr(workflow_run, "is_completed", False):
