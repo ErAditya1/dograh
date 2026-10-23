@@ -1290,7 +1290,11 @@ async def get_all_organization_calls(
         # - If campaign_id is explicitly provided, filter directly to that campaign
         # - Otherwise, match run.campaign_id in camp_ids, or workflow.org_id, or extra.org_id
         if campaign_id is not None:
+            c_row = await session.get(CampaignModel, campaign_id)
+            c_wf_id = c_row.workflow_id if c_row else None
             org_filter_clauses = [WorkflowRunModel.campaign_id == campaign_id]
+            if c_wf_id:
+                org_filter_clauses.append(WorkflowRunModel.workflow_id == c_wf_id)
         else:
             org_filter_clauses = [
                 WorkflowModel.organization_id == org_id,
@@ -1378,7 +1382,9 @@ async def get_all_organization_calls(
 
             wf_name = wf_map.get(r.workflow_id, "AI Caller")
             camp_name = camp_map.get(r.campaign_id) if r.campaign_id else (
-                f"Campaign Test: {wf_name}" if call_type == "campaign-test" else f"Caller Test: {wf_name}"
+                camp_map.get(campaign_id) if campaign_id and campaign_id in camp_map else (
+                    f"Campaign Test: {wf_name}" if call_type == "campaign-test" else f"Caller Test: {wf_name}"
+                )
             )
 
             has_rec = bool(
@@ -1450,11 +1456,60 @@ async def get_all_organization_calls(
                 or ""
             )
 
+            # Quality Analytics
+            qa_score = annotations.get("qa_score")
+            qa_sentiment = annotations.get("qa_sentiment") or annotations.get("sentiment")
+            qa_tags = annotations.get("qa_tags") or annotations.get("tags") or []
+            qa_summary = annotations.get("qa_summary") or annotations.get("summary")
+
+            qa_direct = annotations.get("qa_analysis") or annotations.get("quality_analytics")
+            if isinstance(qa_direct, dict):
+                if qa_score is None:
+                    qa_score = qa_direct.get("score") or qa_direct.get("qa_score")
+                if qa_sentiment is None:
+                    qa_sentiment = qa_direct.get("sentiment") or qa_direct.get("overall_sentiment")
+                if qa_summary is None:
+                    qa_summary = qa_direct.get("summary") or qa_direct.get("qa_summary")
+                if not qa_tags:
+                    qa_tags = qa_direct.get("tags") or qa_direct.get("qa_tags") or []
+
+            for k, v in annotations.items():
+                if isinstance(v, dict):
+                    node_res = v.get("node_results", {})
+                    for nr in node_res.values():
+                        if isinstance(nr, dict):
+                            if nr.get("score") is not None and qa_score is None:
+                                qa_score = nr.get("score")
+                            if nr.get("overall_sentiment") and qa_sentiment is None:
+                                qa_sentiment = nr.get("overall_sentiment")
+                            if nr.get("summary") and qa_summary is None:
+                                qa_summary = nr.get("summary")
+                            if nr.get("tags") and not qa_tags:
+                                qa_tags = nr.get("tags")
+            if qa_score is None and "call_quality_score" in ext_vars:
+                qa_score = ext_vars["call_quality_score"]
+
+            # Schedule / Appointment booking
+            schedule_booked = False
+            schedule_info = None
+            if extra.get("schedule_info"):
+                schedule_booked = True
+                schedule_info = extra.get("schedule_info")
+            elif intent == "appointment" or any(k in ext_vars for k in ["scheduled_date", "appointment_date", "booking_slot", "scheduled_time", "slot"]):
+                schedule_booked = True
+                schedule_info = {
+                    k: ext_vars[k] for k in ["scheduled_date", "appointment_date", "booking_slot", "scheduled_time", "slot", "meeting_link", "email"]
+                    if k in ext_vars
+                }
+            if not schedule_info and (gathered.get("schedule") or gathered.get("booking") or gathered.get("appointment")):
+                schedule_booked = True
+                schedule_info = gathered.get("schedule") or gathered.get("booking") or gathered.get("appointment")
+
             formatted_calls.append({
                 "id": str(r.id),
                 "phone": phone,
                 "name": name,
-                "campaignId": str(r.campaign_id) if r.campaign_id else f"test_{r.id}",
+                "campaignId": str(r.campaign_id or campaign_id or f"test_{r.id}"),
                 "campaignName": camp_name,
                 "callType": call_type,
                 "workflowId": r.workflow_id,
@@ -1470,6 +1525,13 @@ async def get_all_organization_calls(
                 "objections": objections,
                 "summary": summary,
                 "extracted_data": ext_vars,
+                "annotations": annotations,
+                "qa_score": qa_score,
+                "qa_sentiment": qa_sentiment,
+                "qa_tags": qa_tags,
+                "qa_summary": qa_summary,
+                "schedule_booked": schedule_booked,
+                "schedule_info": schedule_info,
             })
 
 
@@ -2197,6 +2259,93 @@ async def get_campaign_run_detail(
         or ""
     )
 
+    # Extract appointment / schedule booking data if present
+    appointment_data = None
+    try:
+        from api.db.models import ScheduledAppointmentModel
+        from sqlalchemy import select
+        async with db_client.get_async_session() as sess:
+            stmt = select(ScheduledAppointmentModel).where(ScheduledAppointmentModel.run_id == run.id)
+            res = await sess.execute(stmt)
+            appt = res.scalars().first()
+            if appt:
+                appointment_data = {
+                    "id": appt.id,
+                    "customer_name": appt.customer_name,
+                    "customer_phone": appt.customer_phone,
+                    "customer_email": appt.customer_email,
+                    "scheduled_start": appt.scheduled_start.isoformat() if appt.scheduled_start else None,
+                    "scheduled_end": appt.scheduled_end.isoformat() if appt.scheduled_end else None,
+                    "status": appt.status,
+                    "meeting_link": appt.meeting_link,
+                    "notes": appt.notes,
+                }
+    except Exception as e:
+        logger.debug(f"Could not load appointment for run {run.id}: {e}")
+
+    if not appointment_data:
+        sched = (
+            gathered.get("schedule")
+            or gathered.get("booking")
+            or gathered.get("appointment")
+            or (run.extra or {}).get("schedule_info")
+        )
+        if sched and isinstance(sched, dict):
+            appointment_data = sched
+        elif any(k in extracted for k in ["scheduled_date", "appointment_date", "booking_slot", "scheduled_time", "slot"]):
+            appointment_data = {
+                "status": "confirmed",
+                "scheduled_date": extracted.get("scheduled_date") or extracted.get("appointment_date"),
+                "scheduled_time": extracted.get("scheduled_time") or extracted.get("booking_slot") or extracted.get("slot"),
+                "customer_email": extracted.get("email") or extracted.get("customer_email"),
+                "notes": extracted.get("booking_notes") or extracted.get("notes"),
+                "meeting_link": extracted.get("meeting_link"),
+            }
+
+    # Extract quality analytics
+    qa_analytics_data = None
+    if run.annotations and isinstance(run.annotations, dict):
+        qa_nodes_res = {}
+        top_score = run.annotations.get("qa_score")
+        top_sentiment = run.annotations.get("qa_sentiment") or run.annotations.get("sentiment")
+        top_summary = run.annotations.get("qa_summary") or run.annotations.get("summary")
+        all_tags = run.annotations.get("qa_tags") or run.annotations.get("tags") or []
+
+        qa_direct = run.annotations.get("qa_analysis") or run.annotations.get("quality_analytics")
+        if isinstance(qa_direct, dict):
+            if top_score is None:
+                top_score = qa_direct.get("score") or qa_direct.get("qa_score")
+            if top_sentiment is None:
+                top_sentiment = qa_direct.get("sentiment") or qa_direct.get("overall_sentiment")
+            if top_summary is None:
+                top_summary = qa_direct.get("summary") or qa_direct.get("qa_summary")
+            if not all_tags:
+                all_tags = qa_direct.get("tags") or qa_direct.get("qa_tags") or []
+            qa_nodes_res["qa_analysis"] = qa_direct
+
+        for k, v in run.annotations.items():
+            if isinstance(v, dict) and "node_results" in v:
+                qa_nodes_res[k] = v
+                for nr in v.get("node_results", {}).values():
+                    if isinstance(nr, dict):
+                        if nr.get("score") is not None and top_score is None:
+                            top_score = nr.get("score")
+                        if nr.get("overall_sentiment") and top_sentiment is None:
+                            top_sentiment = nr.get("overall_sentiment")
+                        if nr.get("summary") and top_summary is None:
+                            top_summary = nr.get("summary")
+                        if nr.get("tags") and not all_tags:
+                            all_tags = nr.get("tags")
+
+        if qa_nodes_res or top_score is not None or all_tags or top_summary:
+            qa_analytics_data = {
+                "score": top_score,
+                "overall_sentiment": top_sentiment,
+                "summary": top_summary,
+                "tags": all_tags,
+                "details": qa_nodes_res,
+            }
+
     return {
         "id": run.id,
         "campaign_id": run.campaign_id,
@@ -2227,6 +2376,8 @@ async def get_campaign_run_detail(
         "cost_info": run.cost_info,
         "logs": run.logs,
         "annotations": run.annotations,
+        "appointment": appointment_data,
+        "qa_analytics": qa_analytics_data,
         "created_at": run.created_at.isoformat() if run.created_at else None,
     }
 
@@ -2662,16 +2813,24 @@ async def get_campaign_contacts(
                 })
 
         # 3. Query workflow_runs for this campaign to attach real duration, intent, and live status
+        c_row = await session.get(CampaignModel, campaign_id)
+        c_wf_id = c_row.workflow_id if c_row else None
+        wf_sql = "campaign_id = :campaign_id"
+        wf_params: Dict[str, Any] = {"campaign_id": campaign_id}
+        if c_wf_id:
+            wf_sql = "(campaign_id = :campaign_id OR workflow_id = :c_wf_id)"
+            wf_params["c_wf_id"] = c_wf_id
+
         wf_res = await session.execute(
             text(
-                """
+                f"""
                 SELECT id, is_completed, usage_info, gathered_context, annotations, initial_context, created_at, mode
                 FROM workflow_runs
-                WHERE campaign_id = :campaign_id
+                WHERE {wf_sql}
                 ORDER BY id ASC
                 """
             ),
-            {"campaign_id": campaign_id},
+            wf_params,
         )
         for wf in wf_res.fetchall():
             init_c = wf.initial_context or {}

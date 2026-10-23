@@ -203,3 +203,4 @@ app.include_router(smartflo_root_router)
 # Mounted under /api/v1 so existing reverse-proxy rules (nginx etc.) route it
 # without any extra configuration.
 app.mount(f"{API_PREFIX}/mcp", mcp_app)
+# Application reloaded with updated storage configuration

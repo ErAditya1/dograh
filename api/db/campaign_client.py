@@ -628,9 +628,17 @@ class CampaignClient(BaseDBClient):
                 raise ValueError(f"Campaign {campaign_id} not found")
 
             # Build base query
-            base_query = select(WorkflowRunModel).where(
-                WorkflowRunModel.campaign_id == campaign_id
-            )
+            if campaign.workflow_id:
+                base_query = select(WorkflowRunModel).where(
+                    or_(
+                        WorkflowRunModel.campaign_id == campaign_id,
+                        WorkflowRunModel.workflow_id == campaign.workflow_id,
+                    )
+                )
+            else:
+                base_query = select(WorkflowRunModel).where(
+                    WorkflowRunModel.campaign_id == campaign_id
+                )
 
             # Apply filters
             base_query = apply_workflow_run_filters(base_query, filters)

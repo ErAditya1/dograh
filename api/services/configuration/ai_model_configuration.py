@@ -366,11 +366,9 @@ def merge_ai_model_configuration_v2_secrets(
     incoming: OrganizationAIModelConfigurationV2,
     existing: OrganizationAIModelConfigurationV2 | None,
 ) -> OrganizationAIModelConfigurationV2:
-    if existing is None:
-        return incoming
-
     incoming_dict = incoming.model_dump(mode="json", exclude_none=True)
-    existing_dict = existing.model_dump(mode="json", exclude_none=True)
+    existing_dict = existing.model_dump(mode="json", exclude_none=True) if existing is not None else {}
+    use_platform_credentials = bool(incoming_dict.get("use_platform_credentials"))
 
     if incoming_dict.get("mode") == "dograh" and existing_dict.get("mode") == "dograh":
         incoming_dograh = incoming_dict.get("dograh") or {}
@@ -383,8 +381,12 @@ def merge_ai_model_configuration_v2_secrets(
                 existing_key,
             )
 
-    if incoming_dict.get("mode") == "byok" and existing_dict.get("mode") == "byok":
-        _merge_byok_secret_fields(incoming_dict.get("byok"), existing_dict.get("byok"))
+    if incoming_dict.get("mode") == "byok":
+        _merge_byok_secret_fields(
+            incoming_dict.get("byok"),
+            existing_dict.get("byok") if existing_dict.get("mode") == "byok" else None,
+            use_platform_credentials=use_platform_credentials,
+        )
 
     return OrganizationAIModelConfigurationV2.model_validate(incoming_dict)
 
@@ -466,50 +468,92 @@ def apply_managed_embeddings_base_url(
     return base_url
 
 
-def _merge_byok_secret_fields(incoming_byok: dict | None, existing_byok: dict | None):
-    if not isinstance(incoming_byok, dict) or not isinstance(existing_byok, dict):
+def _merge_byok_secret_fields(
+    incoming_byok: dict | None,
+    existing_byok: dict | None,
+    use_platform_credentials: bool = False,
+):
+    if not isinstance(incoming_byok, dict):
         return
     incoming_mode = incoming_byok.get("mode")
-    existing_mode = existing_byok.get("mode")
-    if incoming_mode != existing_mode:
-        return
+    existing_mode = existing_byok.get("mode") if isinstance(existing_byok, dict) else None
     section_names = (
         ("llm", "tts", "stt", "embeddings")
         if incoming_mode == "pipeline"
         else ("realtime", "llm", "embeddings")
     )
     incoming_container = incoming_byok.get(incoming_mode)
-    existing_container = existing_byok.get(existing_mode)
-    if not isinstance(incoming_container, dict) or not isinstance(
-        existing_container, dict
-    ):
+    existing_container = (
+        existing_byok.get(existing_mode)
+        if isinstance(existing_byok, dict) and incoming_mode == existing_mode
+        else None
+    )
+    if not isinstance(incoming_container, dict):
         return
     for section_name in section_names:
         incoming_section = incoming_container.get(section_name)
-        existing_section = existing_container.get(section_name)
-        if isinstance(incoming_section, dict) and isinstance(existing_section, dict):
-            _merge_service_secret_fields(incoming_section, existing_section)
+        existing_section = (
+            existing_container.get(section_name)
+            if isinstance(existing_container, dict)
+            else None
+        )
+        if isinstance(incoming_section, dict):
+            _merge_service_secret_fields(
+                incoming_section,
+                existing_section,
+                service_name=section_name,
+                use_platform_credentials=use_platform_credentials,
+            )
 
 
-def _merge_service_secret_fields(incoming: dict, existing: dict):
+def _merge_service_secret_fields(
+    incoming: dict,
+    existing: dict | None,
+    service_name: str | None = None,
+    use_platform_credentials: bool = False,
+):
+    from api.services.platform_keys import get_platform_master_key
+
+    provider = incoming.get("provider")
+    has_master_key = bool(
+        provider and service_name and get_platform_master_key(service_name, str(provider))
+    )
+
     if (
-        incoming.get("provider") is not None
-        and existing.get("provider") is not None
-        and incoming.get("provider") != existing.get("provider")
+        not isinstance(existing, dict)
+        or (
+            incoming.get("provider") is not None
+            and existing.get("provider") is not None
+            and incoming.get("provider") != existing.get("provider")
+        )
     ):
+        # Provider changed or no existing config for this service
+        for secret_field in SERVICE_SECRET_FIELDS:
+            incoming_secret = incoming.get(secret_field)
+            if contains_masked_key(incoming_secret):
+                if use_platform_credentials or has_master_key:
+                    incoming[secret_field] = [] if isinstance(incoming_secret, list) else ""
         return
+
     for secret_field in SERVICE_SECRET_FIELDS:
         if secret_field not in existing:
+            incoming_secret = incoming.get(secret_field)
+            if contains_masked_key(incoming_secret) and (use_platform_credentials or has_master_key):
+                incoming[secret_field] = [] if isinstance(incoming_secret, list) else ""
             continue
         incoming_secret = incoming.get(secret_field)
         existing_secret = existing[secret_field]
         if incoming_secret is None:
             incoming[secret_field] = existing_secret
         elif contains_masked_key(incoming_secret):
-            incoming[secret_field] = resolve_masked_api_keys(
+            resolved = resolve_masked_api_keys(
                 incoming_secret,
                 existing_secret,
             )
+            if contains_masked_key(resolved) and (use_platform_credentials or has_master_key):
+                incoming[secret_field] = [] if isinstance(incoming_secret, list) else ""
+            else:
+                incoming[secret_field] = resolved
 
 
 def _raise_if_masked_secret(value):
