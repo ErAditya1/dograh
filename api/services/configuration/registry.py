@@ -200,7 +200,7 @@ class BaseServiceConfiguration(BaseModel):
         if v is None:
             return v
         if isinstance(v, list) and len(v) == 0:
-            raise ValueError("api_key list must not be empty")
+            return ""
         return v
 
     def __getattribute__(self, name: str):

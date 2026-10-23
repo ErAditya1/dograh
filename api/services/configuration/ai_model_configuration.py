@@ -532,14 +532,14 @@ def _merge_service_secret_fields(
             incoming_secret = incoming.get(secret_field)
             if contains_masked_key(incoming_secret):
                 if use_platform_credentials or has_master_key:
-                    incoming[secret_field] = [] if isinstance(incoming_secret, list) else ""
+                    incoming[secret_field] = ""
         return
 
     for secret_field in SERVICE_SECRET_FIELDS:
         if secret_field not in existing:
             incoming_secret = incoming.get(secret_field)
             if contains_masked_key(incoming_secret) and (use_platform_credentials or has_master_key):
-                incoming[secret_field] = [] if isinstance(incoming_secret, list) else ""
+                incoming[secret_field] = ""
             continue
         incoming_secret = incoming.get(secret_field)
         existing_secret = existing[secret_field]
@@ -551,7 +551,7 @@ def _merge_service_secret_fields(
                 existing_secret,
             )
             if contains_masked_key(resolved) and (use_platform_credentials or has_master_key):
-                incoming[secret_field] = [] if isinstance(incoming_secret, list) else ""
+                incoming[secret_field] = ""
             else:
                 incoming[secret_field] = resolved
 
