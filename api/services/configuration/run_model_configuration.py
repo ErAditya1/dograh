@@ -37,17 +37,34 @@ async def get_effective_ai_model_configuration_for_run(
     """
     from api.services.configuration.ai_model_configuration import (
         get_effective_ai_model_configuration_for_workflow,
+        get_resolved_ai_model_configuration,
     )
     from api.services.configuration.model_connections import (
         hydrate_model_configuration_snapshot,
     )
 
-    snapshot = getattr(workflow_run, "model_configuration_snapshot", None)
-    if isinstance(snapshot, dict) and snapshot:
-        return await hydrate_model_configuration_snapshot(organization_id, snapshot)
     if workflow_configurations is None:
         definition = getattr(workflow_run, "definition", None)
         workflow_configurations = getattr(definition, "workflow_configurations", None)
+
+    configurations = workflow_configurations or {}
+    workflow_override = get_workflow_model_override(configurations)
+
+    resolved_org = await get_resolved_ai_model_configuration(
+        organization_id=organization_id
+    )
+    if (
+        resolved_org.source in ("organization_v2", "platform_defaults")
+        and workflow_override is None
+    ):
+        return await get_effective_ai_model_configuration_for_workflow(
+            organization_id=organization_id,
+            workflow_configurations=workflow_configurations,
+        )
+
+    snapshot = getattr(workflow_run, "model_configuration_snapshot", None)
+    if isinstance(snapshot, dict) and snapshot:
+        return await hydrate_model_configuration_snapshot(organization_id, snapshot)
     return await get_effective_ai_model_configuration_for_workflow(
         organization_id=organization_id,
         workflow_configurations=workflow_configurations,
@@ -143,20 +160,46 @@ async def resolve_run_model_configuration(
     result on the run once. Authorization runs against this setup, so the
     pre-call fetch applied later can only patch within its Dograh key.
     """
+    from api.services.configuration.ai_model_configuration import (
+        get_effective_ai_model_configuration_for_workflow,
+        get_resolved_ai_model_configuration,
+    )
     from api.services.configuration.model_connections import (
         hydrate_model_configuration_snapshot,
         resolve_model_configuration,
     )
 
+    configurations, api_override = _run_inputs(workflow_run)
+    workflow_override = get_workflow_model_override(configurations)
+
+    resolved_org = await get_resolved_ai_model_configuration(
+        organization_id=organization_id
+    )
+    if (
+        resolved_org.source in ("organization_v2", "platform_defaults")
+        and workflow_override is None
+        and api_override is None
+    ):
+        effective = await get_effective_ai_model_configuration_for_workflow(
+            organization_id=organization_id,
+            workflow_configurations=configurations,
+        )
+        try:
+            await validate_workflow_model_compatibility(
+                organization_id, effective, workflow_run.definition
+            )
+        except (HTTPException, ValidationError, ValueError) as exc:
+            raise _configuration_failure(exc) from exc
+        return effective
+
     snapshot = getattr(workflow_run, "model_configuration_snapshot", None)
     if isinstance(snapshot, dict) and snapshot:
         return await hydrate_model_configuration_snapshot(organization_id, snapshot)
 
-    configurations, api_override = _run_inputs(workflow_run)
     try:
         resolved = await resolve_model_configuration(
             organization_id,
-            workflow_override=get_workflow_model_override(configurations),
+            workflow_override=workflow_override,
             api_override=api_override,
         )
         await validate_workflow_model_compatibility(

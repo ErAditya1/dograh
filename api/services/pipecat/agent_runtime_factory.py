@@ -187,12 +187,34 @@ class AgentRuntimeFactory:
             else None
         )
         try:
-            resolved = await resolve_model_configuration(
-                self._organization_id,
-                workflow_override=get_workflow_model_override(run_configs),
-                preferred_dograh_key=run_key,
+            from api.services.configuration.ai_model_configuration import (
+                get_effective_ai_model_configuration_for_workflow,
+                get_resolved_ai_model_configuration,
             )
-            user_config = resolved.effective
+            from api.services.configuration.model_connections import (
+                ResolvedModelConfiguration,
+            )
+
+            resolved_org = await get_resolved_ai_model_configuration(
+                organization_id=self._organization_id
+            )
+            if workflow_override is None and resolved_org.source in ("organization_v2", "platform_defaults"):
+                user_config = await get_effective_ai_model_configuration_for_workflow(
+                    organization_id=self._organization_id,
+                    workflow_configurations=run_configs,
+                )
+                resolved = ResolvedModelConfiguration(
+                    effective=user_config,
+                    snapshot={},
+                    provenance=[{"source": "organization_v2"}],
+                )
+            else:
+                resolved = await resolve_model_configuration(
+                    self._organization_id,
+                    workflow_override=workflow_override,
+                    preferred_dograh_key=run_key,
+                )
+                user_config = resolved.effective
             if get_dograh_service_api_key(user_config) and not run_key:
                 raise HTTPException(
                     status_code=422,
