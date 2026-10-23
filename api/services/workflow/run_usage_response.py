@@ -51,14 +51,23 @@ def format_public_cost_info(
 
     # Include actual billing fields if available
     if cost_info:
-        if cost_info.get("charge_usd") is not None:
-            result["charge_usd"] = cost_info["charge_usd"]
-        if cost_info.get("total_cost_usd") is not None:
-            result["total_cost_usd"] = cost_info["total_cost_usd"]
-        if cost_info.get("rate_per_minute") is not None:
-            result["rate_per_minute"] = cost_info["rate_per_minute"]
-        if cost_info.get("rates") is not None:
-            result["rates"] = cost_info["rates"]
+        for extra_key in (
+            "charge_usd",
+            "total_cost_usd",
+            "llm_cost_usd",
+            "platform_fee_usd",
+            "total_tokens",
+            "prompt_tokens",
+            "completion_tokens",
+            "rate_per_minute",
+            "rates",
+            "charged_to",
+            "plan_credits_deducted",
+            "wallet_cost_usd",
+        ):
+            if cost_info.get(extra_key) is not None:
+                result[extra_key] = cost_info[extra_key]
 
     return result
+
 

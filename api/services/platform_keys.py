@@ -239,3 +239,137 @@ def calculate_run_composite_rate(
         "is_platform_telephony": is_platform_telephony,
         "is_byok": has_any_byok,
     }
+
+
+def get_llm_token_rates(provider: str = "", model: str = "") -> dict:
+    """Get per-million and per-thousand token pricing for an LLM model from platform master keys pricing cache."""
+    st = "llm"
+    prov = (provider or "").lower()
+    model_name = (model or "").lower()
+    entry = _MASTER_KEYS_CACHE.get(st, {}).get(prov, {})
+    pricing = entry.get("models_pricing", {})
+
+    # Check for direct or case-insensitive model match
+    val = None
+    if model in pricing:
+        val = pricing[model]
+    elif model_name in pricing:
+        val = pricing[model_name]
+    else:
+        for k, v in pricing.items():
+            if k.lower() == model_name:
+                val = v
+                break
+
+    if val is None and "default" in pricing:
+        val = pricing["default"]
+
+    # Known standard fallback rates (price in USD per 1M tokens)
+    default_prompt_per_1m = 0.50
+    default_completion_per_1m = 1.50
+    if "4o-mini" in model_name:
+        default_prompt_per_1m = 0.15
+        default_completion_per_1m = 0.60
+    elif "4o" in model_name:
+        default_prompt_per_1m = 2.50
+        default_completion_per_1m = 10.00
+    elif "flash" in model_name:
+        default_prompt_per_1m = 0.10
+        default_completion_per_1m = 0.40
+    elif "claude-3-5-sonnet" in model_name:
+        default_prompt_per_1m = 3.00
+        default_completion_per_1m = 15.00
+    elif "haiku" in model_name:
+        default_prompt_per_1m = 0.25
+        default_completion_per_1m = 1.25
+
+    if isinstance(val, dict):
+        p_rate = (
+            val.get("prompt_rate_per_1m")
+            or val.get("input_rate_per_1m")
+            or val.get("prompt")
+            or val.get("input")
+        )
+        c_rate = (
+            val.get("completion_rate_per_1m")
+            or val.get("output_rate_per_1m")
+            or val.get("completion")
+            or val.get("output")
+        )
+        if val.get("prompt_rate_per_1k") is not None:
+            p_rate = float(val["prompt_rate_per_1k"]) * 1000.0
+        if val.get("completion_rate_per_1k") is not None:
+            c_rate = float(val["completion_rate_per_1k"]) * 1000.0
+        if val.get("price_per_1k_tokens") is not None:
+            p_rate = float(val["price_per_1k_tokens"]) * 1000.0
+            c_rate = float(val["price_per_1k_tokens"]) * 2000.0
+
+        prompt_per_1m = float(p_rate) if p_rate is not None else default_prompt_per_1m
+        completion_per_1m = float(c_rate) if c_rate is not None else default_completion_per_1m
+    elif isinstance(val, (int, float)) and float(val) > 0:
+        rate_val = float(val)
+        # If rate_val < 0.05 (e.g. 0.01 per 1K tokens):
+        if rate_val < 0.05:
+            prompt_per_1m = rate_val * 1000.0
+            completion_per_1m = rate_val * 2000.0
+        else:
+            prompt_per_1m = rate_val
+            completion_per_1m = rate_val * 3.0
+    else:
+        prompt_per_1m = default_prompt_per_1m
+        completion_per_1m = default_completion_per_1m
+
+    return {
+        "prompt_rate_per_1m": round(prompt_per_1m, 6),
+        "completion_rate_per_1m": round(completion_per_1m, 6),
+        "prompt_rate_per_1k": round(prompt_per_1m / 1000.0, 6),
+        "completion_rate_per_1k": round(completion_per_1m / 1000.0, 6),
+    }
+
+
+def calculate_llm_token_cost(
+    provider: str = "",
+    model: str = "",
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    cached_tokens: int = 0,
+    is_byok_llm: bool = False,
+) -> dict:
+    """Calculate the USD cost for LLM token consumption."""
+    if is_byok_llm:
+        return {
+            "total_llm_cost_usd": 0.0,
+            "prompt_cost_usd": 0.0,
+            "completion_cost_usd": 0.0,
+            "cached_discount_usd": 0.0,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "cached_tokens": cached_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "rates": {},
+            "is_byok": True,
+        }
+
+    rates = get_llm_token_rates(provider=provider, model=model)
+    prompt_rate = rates["prompt_rate_per_1m"]
+    completion_rate = rates["completion_rate_per_1m"]
+
+    uncached_prompt = max(prompt_tokens - cached_tokens, 0)
+    prompt_cost = (uncached_prompt / 1_000_000.0) * prompt_rate
+    cached_cost = (cached_tokens / 1_000_000.0) * (prompt_rate * 0.5)
+    completion_cost = (completion_tokens / 1_000_000.0) * completion_rate
+
+    total_cost = round(prompt_cost + cached_cost + completion_cost, 6)
+
+    return {
+        "total_llm_cost_usd": total_cost,
+        "prompt_cost_usd": round(prompt_cost + cached_cost, 6),
+        "completion_cost_usd": round(completion_cost, 6),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "rates": rates,
+        "is_byok": False,
+    }
+

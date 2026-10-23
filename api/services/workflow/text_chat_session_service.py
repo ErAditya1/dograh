@@ -242,16 +242,8 @@ def _build_text_chat_completion_write(
     usage_info["call_duration_seconds"] = duration_secs
 
     cost_info = dict(workflow_run.cost_info or {})
-    cost_info.update(
-        {
-            "total_cost_usd": 0.0,
-            "charge_usd": 0.0,
-            "rate_per_minute": 0.0,
-            "call_duration_seconds": duration_secs,
-            "rates": {"rate_per_minute": 0.0},
-            "charged_to": "text_chat_free",
-        }
-    )
+    cost_info["call_duration_seconds"] = duration_secs
+
 
     return {
         "session_data": completed_session_data,
@@ -645,6 +637,18 @@ async def finalize_completed_text_chat(run_id: int) -> None:
 
 async def _enqueue_text_chat_completion(run_id: int) -> None:
     """Schedule integrations, webhooks, and billing for a completed text chat."""
+    from api.services.workflow_run_billing import (
+        report_completed_workflow_run_platform_usage,
+    )
+    try:
+        await report_completed_workflow_run_platform_usage(run_id)
+    except Exception as e:
+        logger.warning(
+            "Direct billing execution for text chat run {} deferred to completion worker: {}",
+            run_id,
+            e,
+        )
+
     # Imported lazily so API route imports do not eagerly load the ARQ worker
     # task graph.
     from api.tasks.arq import enqueue_job
@@ -654,6 +658,7 @@ async def _enqueue_text_chat_completion(run_id: int) -> None:
         run_id,
         _job_id=f"workflow-completion-{run_id}",
     )
+
 
 
 def _text_chat_duration_seconds(

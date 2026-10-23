@@ -134,10 +134,22 @@ async def test_report_workflow_run_platform_usage_skips_oss(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_report_workflow_run_platform_usage_skips_text_chat(monkeypatch):
+async def test_report_workflow_run_platform_usage_bills_text_chat(monkeypatch):
     workflow_run = _make_workflow_run()
     workflow_run.mode = WorkflowRunMode.TEXTCHAT.value
+    workflow_run.usage_info = {
+        "call_duration_seconds": 30,
+        "llm": {
+            "OpenAILLMService#0|||gpt-4o-mini": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+            }
+        },
+    }
     report_usage = AsyncMock()
+    mock_billing = AsyncMock(return_value={"charged_to": "wallet", "wallet_cost_usd": 0.005})
+    mock_limits = SimpleNamespace(byok_platform_fee_per_minute_usd=0.04, tier="pay_as_you_go")
 
     monkeypatch.setattr(workflow_run_billing_mod, "DEPLOYMENT_MODE", "saas")
     monkeypatch.setattr(
@@ -145,10 +157,24 @@ async def test_report_workflow_run_platform_usage_skips_text_chat(monkeypatch):
         "report_platform_usage",
         report_usage,
     )
+    from api.services.plan_service import plan_service
+
+    monkeypatch.setattr(
+        plan_service, "get_effective_limits", AsyncMock(return_value=mock_limits)
+    )
+    monkeypatch.setattr(plan_service, "record_text_chat_billing", mock_billing)
+    monkeypatch.setattr(
+        workflow_run_billing_mod.db_client, "update_workflow_run", AsyncMock()
+    )
 
     await report_workflow_run_platform_usage(workflow_run)
 
     report_usage.assert_not_awaited()
+    mock_billing.assert_awaited_once()
+    assert hasattr(workflow_run, "cost_info")
+    assert workflow_run.cost_info["total_tokens"] == 150
+    assert workflow_run.cost_info["total_cost_usd"] > 0
+
 
 
 @pytest.mark.asyncio

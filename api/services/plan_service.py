@@ -800,6 +800,74 @@ class PlanService:
             "overage_rate_per_minute": limits.overage_rate_per_minute_usd,
         }
 
+    async def record_text_chat_billing(
+        self,
+        organization_id: int,
+        total_cost_usd: float,
+        duration_seconds: float = 0.0,
+        total_tokens: int = 0,
+    ) -> Dict[str, Any]:
+        """Allocate text chat cost between monthly subscription included credits and platform wallet overage."""
+        limits = await self.get_effective_limits(organization_id)
+        cost_usd = round(float(total_cost_usd), 4)
+
+        charged_to = "wallet"
+        plan_credits_deducted = 0.0
+        wallet_cost_usd = 0.0
+        new_wallet_balance = limits.wallet_balance_usd
+        new_plan_credits = limits.plan_credits_remaining_usd
+
+        if limits.plan_credits_remaining_usd > 0:
+            if limits.plan_credits_remaining_usd >= cost_usd:
+                # Fully covered under monthly plan credits
+                plan_credits_deducted = cost_usd
+                wallet_cost_usd = 0.0
+                new_plan_credits = round(limits.plan_credits_remaining_usd - plan_credits_deducted, 4)
+                charged_to = "plan_credits"
+            else:
+                # Partially covered by plan credits, remainder charged to wallet
+                plan_credits_deducted = limits.plan_credits_remaining_usd
+                wallet_cost_usd = round(cost_usd - plan_credits_deducted, 4)
+                new_plan_credits = 0.0
+                charged_to = "split"
+        else:
+            # Fully charged to wallet
+            plan_credits_deducted = 0.0
+            wallet_cost_usd = cost_usd
+            charged_to = "wallet"
+
+        # 1. Update plan_credits_remaining_usd in database
+        if plan_credits_deducted > 0:
+            async with db_client.async_session() as session:
+                stmt = (
+                    update(OrganizationModel)
+                    .where(OrganizationModel.id == organization_id)
+                    .values(
+                        plan_credits_remaining_usd=new_plan_credits,
+                    )
+                )
+                await session.execute(stmt)
+                await session.commit()
+
+        # 2. Update wallet balance if overage or pay-as-you-go cost incurred
+        if wallet_cost_usd > 0:
+            new_wallet_balance = await db_client.update_wallet_balance(
+                organization_id, -wallet_cost_usd
+            )
+
+        return {
+            "charged_to": charged_to,
+            "total_cost_usd": cost_usd,
+            "plan_credits_deducted": plan_credits_deducted,
+            "plan_credits_remaining": new_plan_credits,
+            "wallet_cost_usd": wallet_cost_usd,
+            "wallet_balance_after": new_wallet_balance,
+            "effective_tier": limits.tier,
+            "total_tokens": total_tokens,
+            "duration_seconds": duration_seconds,
+        }
+
 
 plan_service = PlanService()
+
 

@@ -40,33 +40,224 @@ def _is_usage_not_ready_error(exc: Exception) -> bool:
     return "usage_not_ready" in (getattr(response, "text", "") or "")
 
 
+async def _report_text_chat_platform_usage(workflow_run) -> None:
+    """Calculate token-based LLM cost + platform service charge and deduct from plan credits and wallet."""
+    organization_id = _workflow_run_organization_id(workflow_run)
+    if organization_id is None:
+        logger.warning(
+            "Skipping text chat billing report for workflow run {}: no organization_id",
+            workflow_run.id,
+        )
+        return
+
+    usage_info = getattr(workflow_run, "usage_info", None) or {}
+    duration_seconds = _duration_seconds_from_usage_info(workflow_run) or 0.0
+
+    # 1. Resolve workflow configurations to find configured LLM and BYOK status
+    workflow = getattr(workflow_run, "workflow", None)
+    workflow_config = {}
+    definition = None
+    try:
+        definition = getattr(workflow_run, "definition", None)
+    except Exception:
+        pass
+
+    if not definition and getattr(workflow_run, "definition_id", None):
+        try:
+            definition = await db_client.get_workflow_definition_by_id(
+                workflow_run.definition_id
+            )
+        except Exception:
+            pass
+
+    if definition and getattr(definition, "workflow_configurations", None):
+        workflow_config = definition.workflow_configurations
+    elif workflow and getattr(workflow, "workflow_configurations", None):
+        workflow_config = workflow.workflow_configurations
+
+    model_overrides = (workflow_config or {}).get("model_overrides") or {}
+    llm_info = model_overrides.get("llm") or {}
+
+    if not llm_info.get("provider"):
+        try:
+            from api.services.configuration.ai_model_configuration import (
+                get_organization_ai_model_configuration_v2,
+            )
+            org_config = await get_organization_ai_model_configuration_v2(organization_id)
+            if org_config and getattr(org_config, "byok", None) and getattr(org_config.byok, "pipeline", None):
+                pipe = org_config.byok.pipeline
+                if getattr(pipe, "llm", None):
+                    llm_info = {
+                        "provider": getattr(pipe.llm, "provider", ""),
+                        "model": getattr(pipe.llm, "model", ""),
+                    }
+        except Exception as e:
+            logger.warning("Could not load organization global model config for text chat billing: {}", e)
+
+    is_byok_run = False
+    try:
+        from api.services.configuration.ai_model_configuration import (
+            get_effective_ai_model_configuration_for_workflow,
+            uses_managed_model_services_v2,
+        )
+        user_ai_config = await get_effective_ai_model_configuration_for_workflow(
+            organization_id=organization_id,
+            workflow_configurations=workflow_config,
+        )
+        is_byok_run = not uses_managed_model_services_v2(user_ai_config)
+    except Exception:
+        pass
+
+    # 2. Sum tokens from usage_info["llm"]
+    llm_usage = usage_info.get("llm") or {}
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_cached_tokens = 0
+    total_tokens = 0
+
+    from api.services.platform_keys import calculate_llm_token_cost
+
+    llm_costs = []
+    default_provider = llm_info.get("provider") or "openai"
+    default_model = llm_info.get("model") or "gpt-4o-mini"
+
+    if isinstance(llm_usage, dict) and llm_usage:
+        for key, entry in llm_usage.items():
+            if not isinstance(entry, dict):
+                continue
+            p_tok = int(entry.get("prompt_tokens") or 0)
+            c_tok = int(entry.get("completion_tokens") or 0)
+            cache_tok = int(entry.get("cache_read_input_tokens") or 0)
+            t_tok = int(entry.get("total_tokens") or (p_tok + c_tok))
+
+            total_prompt_tokens += p_tok
+            total_completion_tokens += c_tok
+            total_cached_tokens += cache_tok
+            total_tokens += t_tok
+
+            model_name = key.split("|||")[-1] if "|||" in key else default_model
+            provider_name = default_provider
+            if "gemini" in model_name.lower():
+                provider_name = "google"
+            elif "claude" in model_name.lower():
+                provider_name = "anthropic"
+            elif "gpt" in model_name.lower():
+                provider_name = "openai"
+
+            cost_res = calculate_llm_token_cost(
+                provider=provider_name,
+                model=model_name,
+                prompt_tokens=p_tok,
+                completion_tokens=c_tok,
+                cached_tokens=cache_tok,
+                is_byok_llm=is_byok_run,
+            )
+            llm_costs.append(cost_res)
+    else:
+        cost_res = calculate_llm_token_cost(
+            provider=default_provider,
+            model=default_model,
+            prompt_tokens=0,
+            completion_tokens=0,
+            is_byok_llm=is_byok_run,
+        )
+        llm_costs.append(cost_res)
+
+    total_llm_cost_usd = sum(c["total_llm_cost_usd"] for c in llm_costs)
+
+    # 3. Calculate Platform Service Charge
+    from api.services.plan_service import plan_service
+    limits = await plan_service.get_effective_limits(organization_id)
+    byok_fee_rate = limits.byok_platform_fee_per_minute_usd or 0.04
+
+    turns_count = 1
+    try:
+        text_session = await db_client.get_workflow_run_text_session(
+            workflow_run.id, organization_id=organization_id
+        )
+        if text_session and text_session.session_data:
+            turns = text_session.session_data.get("turns") or []
+            turns_count = max(len(turns), 1)
+    except Exception:
+        pass
+
+    duration_minutes = duration_seconds / 60.0
+
+    if is_byok_run:
+        # BYOK: Platform orchestration fee for routing, tools, and session state
+        platform_fee_usd = round(
+            max(0.005 * turns_count, duration_minutes * byok_fee_rate), 4
+        )
+    else:
+        # Managed Key: Platform fee + LLM base cost
+        base_fee = duration_minutes * (byok_fee_rate * 0.5)
+        platform_fee_usd = round(max(0.002 * turns_count, base_fee), 4)
+
+    total_cost_usd = round(total_llm_cost_usd + platform_fee_usd, 4)
+
+    # 4. Multi-tier credit-based plan accounting (Plan credits first, wallet second)
+    billing_result = await plan_service.record_text_chat_billing(
+        organization_id=organization_id,
+        total_cost_usd=total_cost_usd,
+        duration_seconds=duration_seconds,
+        total_tokens=total_tokens,
+    )
+
+    cost_info = getattr(workflow_run, "cost_info", None) or {}
+    cost_info.update(
+        {
+            "total_cost_usd": total_cost_usd,
+            "charge_usd": billing_result.get("wallet_cost_usd", 0.0),
+            "llm_cost_usd": round(total_llm_cost_usd, 4),
+            "platform_fee_usd": platform_fee_usd,
+            "call_duration_seconds": duration_seconds,
+            "total_tokens": total_tokens,
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "rates": {
+                "llm_provider": default_provider,
+                "llm_model": default_model,
+                "platform_fee_usd": platform_fee_usd,
+                "is_byok": is_byok_run,
+                "turns_count": turns_count,
+            },
+            "charged_to": billing_result.get("charged_to", "wallet"),
+            "plan_credits_deducted": billing_result.get("plan_credits_deducted", 0.0),
+            "plan_credits_remaining": billing_result.get("plan_credits_remaining", 0.0),
+            "wallet_cost_usd": billing_result.get("wallet_cost_usd", 0.0),
+            "wallet_balance_after": billing_result.get("wallet_balance_after", 0.0),
+            "effective_tier": billing_result.get("effective_tier", "pay_as_you_go"),
+        }
+    )
+
+    if hasattr(db_client, "update_workflow_run"):
+        await db_client.update_workflow_run(
+            workflow_run.id, cost_info=cost_info
+        )
+
+    logger.info(
+        "Text chat usage recorded for run {} (tokens: {}, LLM: ${}, Platform: ${}, Total: ${}, charged to {}): plan_credits_deducted={}, wallet_charge=${}, balance_after={}",
+        workflow_run.id,
+        total_tokens,
+        round(total_llm_cost_usd, 4),
+        platform_fee_usd,
+        total_cost_usd,
+        billing_result.get("charged_to", "wallet"),
+        billing_result.get("plan_credits_deducted", 0.0),
+        billing_result.get("wallet_cost_usd", 0.0),
+        billing_result.get("wallet_balance_after", 0.0),
+    )
+
+
 async def report_workflow_run_platform_usage(workflow_run) -> None:
     """Report hosted platform usage for a completed workflow run and deduct platform credits."""
     if getattr(workflow_run, "mode", None) == WorkflowRunMode.TEXTCHAT.value:
-        logger.info(
-            "Skipping platform usage report for text chat workflow run {}",
-            workflow_run.id,
-        )
         try:
-            duration_seconds = _duration_seconds_from_usage_info(workflow_run) or 0
-            cost_info = getattr(workflow_run, "cost_info", None) or {}
-            cost_info.update(
-                {
-                    "total_cost_usd": 0.0,
-                    "charge_usd": 0.0,
-                    "rate_per_minute": 0.0,
-                    "call_duration_seconds": duration_seconds,
-                    "rates": {"rate_per_minute": 0.0},
-                    "charged_to": "text_chat_free",
-                }
-            )
-            if hasattr(db_client, "update_workflow_run"):
-                await db_client.update_workflow_run(
-                    workflow_run.id, cost_info=cost_info
-                )
+            await _report_text_chat_platform_usage(workflow_run)
         except Exception as e:
-            logger.warning("Failed to persist zero cost_info for text chat run {}: {}", workflow_run.id, e)
+            logger.error("Failed to bill text chat workflow run {}: {}", workflow_run.id, e)
         return
+
 
     if not getattr(workflow_run, "is_completed", False):
         logger.warning(
